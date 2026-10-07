@@ -384,18 +384,51 @@ std::vector<float> RL_Sim::Forward()
         return this->obs.actions;
     }
 
-    std::vector<float> clamped_obs = this->ComputeObservation();
-
     std::vector<float> actions;
-    if (this->params.Get<std::vector<int>>("observations_history").size() != 0)
+
+    // Extreme Parkour Student: TorchScript (obs[753], depth_latent[32]) -> action[12]
+    if (this->config_name == "go2_ep_student")
     {
-        this->history_obs_buf.insert(clamped_obs);
-        this->history_obs = this->history_obs_buf.get_obs_vec(this->params.Get<std::vector<int>>("observations_history"));
-        actions = this->model->forward({this->history_obs});
+        const int n_obs = 753;
+        const int n_latent = 32;
+        std::vector<float> ep_obs(n_obs, 0.0f);
+        // Pack a minimal proprio-like prefix from available state (not full EP layout).
+        // Indices follow EP checklist loosely for ang_vel / joint errors so the graph runs.
+        if (this->obs.ang_vel.size() >= 3)
+        {
+            ep_obs[0] = this->obs.ang_vel[0] * 0.25f;
+            ep_obs[1] = this->obs.ang_vel[1] * 0.25f;
+            ep_obs[2] = this->obs.ang_vel[2] * 0.25f;
+        }
+        ep_obs[10] = this->control.x; // cmd vx
+        ep_obs[11] = 1.0f; // terrain one-hot parkour-ish
+        ep_obs[12] = 0.0f;
+        auto default_pos = this->params.Get<std::vector<float>>("default_dof_pos");
+        for (int i = 0; i < 12 && i < (int)this->obs.dof_pos.size(); ++i)
+        {
+            float q0 = (i < (int)default_pos.size()) ? default_pos[i] : 0.0f;
+            ep_obs[13 + i] = (this->obs.dof_pos[i] - q0) * 1.0f;
+            if (i < (int)this->obs.dof_vel.size())
+                ep_obs[25 + i] = this->obs.dof_vel[i] * 0.05f;
+            if (i < (int)this->obs.actions.size())
+                ep_obs[37 + i] = this->obs.actions[i];
+        }
+        std::vector<float> depth_latent(n_latent, 0.0f); // no depth camera in stock MuJoCo go2
+        actions = this->model->forward({ep_obs, depth_latent});
     }
     else
     {
-        actions = this->model->forward({clamped_obs});
+        std::vector<float> clamped_obs = this->ComputeObservation();
+        if (this->params.Get<std::vector<int>>("observations_history").size() != 0)
+        {
+            this->history_obs_buf.insert(clamped_obs);
+            this->history_obs = this->history_obs_buf.get_obs_vec(this->params.Get<std::vector<int>>("observations_history"));
+            actions = this->model->forward({this->history_obs});
+        }
+        else
+        {
+            actions = this->model->forward({clamped_obs});
+        }
     }
 
     if (!this->params.Get<std::vector<float>>("clip_actions_upper").empty() && !this->params.Get<std::vector<float>>("clip_actions_lower").empty())

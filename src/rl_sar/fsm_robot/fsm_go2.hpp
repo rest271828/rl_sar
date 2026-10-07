@@ -8,6 +8,7 @@
 
 #include "fsm.hpp"
 #include "rl_sdk.hpp"
+#include <cstdlib>
 
 namespace go2_fsm
 {
@@ -38,7 +39,10 @@ public:
 
     std::string CheckChange() override
     {
-        if (rl.control.current_keyboard == Input::Keyboard::Num0 || rl.control.current_gamepad == Input::Gamepad::A)
+        const char* auto_rl = std::getenv("RL_SAR_AUTO_RL");
+        if ((auto_rl && *auto_rl && std::string(auto_rl) != "0") ||
+            rl.control.current_keyboard == Input::Keyboard::Num0 ||
+            rl.control.current_gamepad == Input::Gamepad::A)
         {
             return "RLFSMStateGetUp";
         }
@@ -102,7 +106,10 @@ public:
         }
         if (percent_getup >= 1.0f)
         {
-            if (rl.control.current_keyboard == Input::Keyboard::Num1 || rl.control.current_gamepad == Input::Gamepad::RB_DPadUp)
+            const char* auto_rl = std::getenv("RL_SAR_AUTO_RL");
+            if ((auto_rl && *auto_rl && std::string(auto_rl) != "0") ||
+                rl.control.current_keyboard == Input::Keyboard::Num1 ||
+                rl.control.current_gamepad == Input::Gamepad::RB_DPadUp)
             {
                 return "RLFSMStateRLLocomotion";
             }
@@ -161,8 +168,17 @@ public:
         percent_transition = 0.0f;
         rl.episode_length_buf = 0;
 
-        // read params from yaml
-        rl.config_name = "himloco";
+        // Policy slot: RL_SAR_GO2_CONFIG=himloco|robot_lab|go2_ep_student (default himloco)
+        {
+            const char* env_cfg = std::getenv("RL_SAR_GO2_CONFIG");
+            rl.config_name = (env_cfg && *env_cfg) ? std::string(env_cfg) : "himloco";
+        }
+        if (rl.config_name == "go2_ep_student")
+        {
+            std::cout << LOGGER::WARNING
+                      << "go2_ep_student: MuJoCo Forward uses dual-input JIT with ZERO depth latent "
+                      << "(no depth camera). For vision MXD use sim_isaac_bridge.py." << std::endl;
+        }
         std::string robot_config_path = rl.robot_name + "/" + rl.config_name;
         try
         {

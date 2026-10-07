@@ -66,18 +66,21 @@ std::vector<float> TorchModel::forward(const std::vector<std::vector<float>>& in
 #ifdef USE_TORCH
     try
     {
-        // Convert input vector to Torch tensor (use first input only)
-        const auto& input = inputs[0];
-        auto input_tensor = torch::tensor(input, torch::kFloat32).reshape({1, static_cast<int64_t>(input.size())});
-
         // Disable gradient computation before each forward pass
         torch::autograd::GradMode::set_enabled(false);
 
         // Ensure single-threaded execution (critical for performance!)
         torch::set_num_threads(1);
 
-        // Execute forward inference
-        auto output = model_.forward({input_tensor}).toTensor();
+        // Support single- or multi-tensor TorchScript graphs (EP Student needs obs+latent)
+        std::vector<torch::jit::IValue> ivalues;
+        ivalues.reserve(inputs.size());
+        for (const auto& input : inputs)
+        {
+            auto input_tensor = torch::tensor(input, torch::kFloat32).reshape({1, static_cast<int64_t>(input.size())});
+            ivalues.emplace_back(input_tensor);
+        }
+        auto output = model_.forward(ivalues).toTensor();
 
         // Convert output tensor to vector
         return torch_to_vector(output);
