@@ -2,6 +2,7 @@
 """Offline dry-run for Extreme Parkour Go2 Student on the rl_sar policy slot.
 
 Loads base_jit + vision_weight, runs dummy depth+obs, prints 12-dim actions.
+Depth GRU advances only every update_interval (=5) steps; other steps reuse latent (deploy cadence).
 No robot / ROS required.
 
 Example:
@@ -105,14 +106,20 @@ def main() -> int:
 
     encoder.reset_hidden()
     last_action = None
+    update_interval = 5  # match env.cfg.depth.update_interval / evaluate.py
+    latent = torch.zeros(1, 32, device=device)
+    yaw = torch.zeros(1, 2, device=device)
     with torch.no_grad():
         for t in range(args.steps):
-            proprio = obs[:, :N_PROPRIO]
-            depth_out = encoder(depth, proprio)  # [1, 34]
-            latent = depth_out[:, :-2]
-            yaw = YAW_SCALE * depth_out[:, -2:]
-            obs[:, 6:8] = yaw
-            action = policy(obs, latent)
+            # Advance depth GRU only on the deploy cadence (not every control step).
+            if t % update_interval == 0:
+                proprio = obs[:, :N_PROPRIO].clone()
+                proprio[:, 6:8] = 0
+                depth_out = encoder(depth, proprio)  # [1, 34]
+                latent = depth_out[:, :-2]
+                yaw = depth_out[:, -2:]
+            obs[:, 6:8] = YAW_SCALE * yaw
+            action = policy(obs.clone(), latent)
             action_clipped = action.clamp(-ACTION_CLIP, ACTION_CLIP)
             last_action = action_clipped
             a = action_clipped.flatten()

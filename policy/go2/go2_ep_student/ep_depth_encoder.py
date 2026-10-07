@@ -13,7 +13,7 @@ import torch.nn as nn
 
 
 class DepthOnlyFCBackbone58x87(nn.Module):
-    def __init__(self, scandots_output_dim: int = 32, output_activation: str = "tanh", num_frames: int = 1):
+    def __init__(self, scandots_output_dim: int = 32, output_activation: str = "elu", num_frames: int = 1):
         super().__init__()
         self.num_frames = num_frames
         activation = nn.ELU()
@@ -28,7 +28,7 @@ class DepthOnlyFCBackbone58x87(nn.Module):
             activation,
             nn.Linear(128, scandots_output_dim),
         )
-        self.output_activation = nn.Tanh() if output_activation == "tanh" else activation
+        self.output_activation = nn.Tanh() if output_activation == "tanh" else activation  # train/runner default: ELU
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         # images: [B, H, W] or [B, 1, H, W]
@@ -42,7 +42,7 @@ class RecurrentDepthBackbone(nn.Module):
     def __init__(self, n_proprio: int = 53) -> None:
         super().__init__()
         activation = nn.ELU()
-        self.base_backbone = DepthOnlyFCBackbone58x87(32, output_activation="tanh")
+        self.base_backbone = DepthOnlyFCBackbone58x87(32, output_activation="elu")  # match OnPolicyRunner
         self.combination_mlp = nn.Sequential(
             nn.Linear(32 + n_proprio, 128),
             activation,

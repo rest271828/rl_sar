@@ -2,8 +2,9 @@
 """Sim smoke / MXD measure: EP Student via Isaac Gym + go2_ep_student sidecar.
 
 Backends:
-  jit  — deploy path: vision_weight + base_jit (estimator inside JIT)
-  ckpt — evaluate.py path: depth_encoder + depth_actor from model_*.pt
+  jit      — deploy path: vision_weight + base_jit (estimator inside JIT; NO GT priv)
+  ckpt     — evaluate.py path: depth_actor + GT priv_explicit (oracle; NOT deploy)
+  ckpt_est — depth_actor + estimator-filled priv (fair deploy twin of jit)
 
 Example:
   source /home/yihan/extreme-parkour/activate.sh
@@ -129,8 +130,8 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--terrain", choices=["flat", "parkour"], default="parkour")
-    ap.add_argument("--backend", choices=["jit", "ckpt"], default="jit",
-                    help="jit=deploy TorchScript; ckpt=evaluate.py depth_actor path")
+    ap.add_argument("--backend", choices=["jit", "ckpt", "ckpt_est"], default="jit",
+                    help="jit=deploy TorchScript; ckpt=GT priv evaluate; ckpt_est=estimator+depth_actor")
     ap.add_argument("--log-every", type=int, default=100)
     ap.add_argument("--preclamp", action="store_true",
                     help="clamp actions to +/-4.8 before env.step (env already clips)")
@@ -192,6 +193,11 @@ def main() -> int:
     depth_encoder = None
     policy_jit = None
     depth_actor = None
+    estimator = None
+    n_scan = int(env.cfg.env.n_scan)
+    n_priv_e = int(env.cfg.env.n_priv)
+    update_interval = int(getattr(env.cfg.depth, "update_interval", 5))
+    print(f"[sim_isaac_bridge] depth.update_interval={update_interval} (encoder advances only when extras['depth'] is not None)")
 
     if args.backend == "jit":
         print(f"[sim_isaac_bridge] base_jit={base_path}")
@@ -205,7 +211,7 @@ def main() -> int:
         policy_jit = torch.jit.load(base_path, map_location=device)
         policy_jit.eval()
     else:
-        # evaluate.py path: load full runner, use depth_encoder + depth_actor
+        # ckpt / ckpt_est: load runner depth_encoder + depth_actor (+ estimator for ckpt_est)
         log_pth = os.path.join("../../logs", ep_args.proj_name, ep_args.exptid)
         train_cfg.runner.resume = True
         ppo_runner, train_cfg, log_pth = task_registry.make_alg_runner(
@@ -217,15 +223,19 @@ def main() -> int:
         depth_actor.eval()
         if hasattr(depth_encoder, "hidden_states"):
             depth_encoder.hidden_states = None
+        if args.backend == "ckpt_est":
+            estimator = ppo_runner.get_estimator_inference_policy(device=device)
+            print(f"[sim_isaac_bridge] ckpt_est: depth_actor + estimator (fair deploy twin of jit)")
         print(f"[sim_isaac_bridge] ckpt log_pth={log_pth}")
 
-    # Match evaluate.py: depth extras is only set every update_interval; else None.
-    # Encoder/GRU must advance ONLY when a new depth frame arrives (~10 Hz), not every 50 Hz step.
+    # Match evaluate.py: extras["depth"] is set only every update_interval (else None).
+    # 错误节拍 = advancing depth GRU every 50 Hz control step instead of only on new frames.
+    # Encoder/GRU must advance ONLY when a new depth frame arrives (~10 Hz).
     infos = {
         "depth": env.depth_buffer[:, -1].to(device) if env.cfg.depth.use_camera else None
     }
-    latent = None
-    yaw = None
+    latent = torch.zeros(env.num_envs, 32, device=device)
+    yaw = torch.zeros(env.num_envs, 2, device=device)
     depth_updates = 0
 
     step_rew = []
@@ -248,16 +258,22 @@ def main() -> int:
                     proprio[:, 6:8] = 0
                     depth_out = depth_encoder(infos["depth"].to(device), proprio)
                     latent = depth_out[:, :-2]
-                    yaw = depth_out[:, -2:]  # evaluate: scale applied when writing obs
+                    yaw = depth_out[:, -2:]
                     depth_updates += 1
                 # reuse previous latent/yaw when depth is None (same as evaluate/play)
                 obs[:, 6:8] = YAW_SCALE * yaw
             else:
-                latent = None
+                latent = torch.zeros(env.num_envs, 32, device=device)
 
             if args.backend == "jit":
-                actions = policy_jit(obs, latent)
+                # clone: HardwareVisionNN writes estimator priv in-place into obs
+                actions = policy_jit(obs.detach().clone(), latent)
+            elif args.backend == "ckpt_est":
+                obs_est = obs.detach().clone()
+                obs_est[:, N_PROPRIO + n_scan:N_PROPRIO + n_scan + n_priv_e] = estimator(obs_est[:, :N_PROPRIO])
+                actions = depth_actor(obs_est, hist_encoding=True, scandots_latent=latent)
             else:
+                # ckpt = evaluate.py oracle (GT priv_explicit from sim)
                 actions = depth_actor(obs.detach(), hist_encoding=True, scandots_latent=latent)
 
             act_amax_raw.append(float(actions.abs().max().item()))
@@ -320,7 +336,7 @@ def main() -> int:
     print(f"episode_len_mean={len_mean:.2f}±{len_std:.2f}")
     print(f"MXD(waypoints/7)={mxd:.4f}±{mxd_std:.4f}  (official Student ref ≈0.88)")
     print(f"falls_non_timeout={fall_n}")
-    print(f"depth_encoder_forwards={depth_updates} (expect ~steps/update_interval)")
+    print(f"depth_encoder_forwards={depth_updates} (expect ~steps/{update_interval} = {args.steps / update_interval:.0f})")
     print("OK")
     return 0
 

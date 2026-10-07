@@ -1,11 +1,12 @@
 # Extreme Parkour Go2 Student — rl_sar policy slot (does NOT replace himloco/robot_lab)
-# C++ MuJoCo: RL_SAR_GO2_CONFIG=go2_ep_student (Forward uses dual-input JIT; depth latent=0 without camera)
+# C++ MuJoCo: RL_SAR_GO2_CONFIG=go2_ep_student
+# Depth cadence: update_interval=5 (Isaac/extras only; MuJoCo has no camera → latent=0)
 # Full vision MXD: python policy/go2/go2_ep_student/sim_isaac_bridge.py --backend jit ...
 
 go2/go2_ep_student:
   model_name: "base_jit.pt"
   vision_weight_name: "vision_weight.pt"
-  # InitRL uses these terms for buffer sizing; ForwardEpStudent overrides inference.
+  # InitRL buffer sizing (himloco-shaped); EP Forward builds 753-d obs separately.
   num_observations: 45
   observations: ["ang_vel", "gravity_vec", "commands", "dof_pos", "dof_vel", "actions"]
   observations_history: []
@@ -13,12 +14,14 @@ go2/go2_ep_student:
   ep_num_observations: 753
   ep_depth_latent_dim: 32
   ep_use_dual_input: true
+  ep_update_interval: 5
   clip_obs: 100.0
   clip_actions_lower: [-4.8, -4.8, -4.8, -4.8, -4.8, -4.8, -4.8, -4.8, -4.8, -4.8, -4.8, -4.8]
   clip_actions_upper: [4.8, 4.8, 4.8, 4.8, 4.8, 4.8, 4.8, 4.8, 4.8, 4.8, 4.8, 4.8]
   rl_kp: [40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40]
   rl_kd: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
   num_of_dofs: 12
+  # EP/Go2 action_scale=0.25 on all joints
   action_scale: [0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25]
   wheel_indices: []
   lin_vel_scale: 2.0
@@ -27,5 +30,7 @@ go2/go2_ep_student:
   dof_vel_scale: 0.05
   commands_scale: [1.0, 1.0, 0.25]
   torque_limits: [23.5, 23.5, 23.5, 23.5, 23.5, 23.5, 23.5, 23.5, 23.5, 23.5, 23.5, 23.5]
-  default_dof_pos: [-0.1, 0.7, -1.5, 0.1, 0.7, -1.5, -0.1, 1.0, -1.5, 0.1, 1.0, -1.5]
-  joint_mapping: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+  # Policy/training order FL,FR,RL,RR (matches EP + himloco joint_mapping)
+  default_dof_pos: [0.1, 0.7, -1.5, -0.1, 0.7, -1.5, 0.1, 1.0, -1.5, -0.1, 1.0, -1.5]
+  # MuJoCo sensor order FR,FL,RR,RL → policy FL,FR,RL,RR (same as EP reindex / himloco)
+  joint_mapping: [3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8]

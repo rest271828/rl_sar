@@ -103,6 +103,20 @@ private:
     std::map<std::string, float> joint_velocities;
     std::map<std::string, float> joint_efforts;
     void StartJointController(const std::string& ros_namespace, const std::vector<std::string>& names);
+
+    // Extreme Parkour Student obs helpers (MuJoCo has no depth camera)
+    static constexpr int EP_N_PROPRIO = 53;
+    static constexpr int EP_N_SCAN = 132;
+    static constexpr int EP_N_PRIV_E = 9;
+    static constexpr int EP_N_PRIV_L = 29;
+    static constexpr int EP_HIST_LEN = 10;
+    static constexpr int EP_N_OBS = EP_N_PROPRIO + EP_N_SCAN + EP_N_PRIV_E + EP_N_PRIV_L + EP_HIST_LEN * EP_N_PROPRIO; // 753
+    std::vector<float> ep_proprio_hist_; // hist_len * n_proprio, oldest→newest
+    std::vector<float> ep_last_action_;  // policy-space 12
+    bool ep_hist_ready_ = false;
+    std::vector<float> BuildEpObservation();
 };
+
+
 
 #endif // RL_SIM_HPP

@@ -4,6 +4,7 @@
  */
 
 #include "rl_sim_mujoco.hpp"
+#include "vector_math.hpp"
 
 RL_Sim* RL_Sim::instance = nullptr;
 
@@ -333,6 +334,21 @@ void RL_Sim::RunModel()
     {
         this->episode_length_buf += 1;
         this->obs.ang_vel = this->robot_state.imu.gyroscope;
+        // Headless smokes: lock commands so Xvfb phantom keystrokes cannot ramp vy/yaw.
+        // RL_SAR_AUTO_RL=1 ⇒ default cmd (0,0,0) unless RL_SAR_CMD_* set.
+        const char* auto_rl = std::getenv("RL_SAR_AUTO_RL");
+        const bool lock_cmd = (auto_rl && *auto_rl && std::string(auto_rl) != "0")
+            || std::getenv("RL_SAR_CMD_X") || std::getenv("RL_SAR_CMD_Y") || std::getenv("RL_SAR_CMD_YAW");
+        if (lock_cmd)
+        {
+            const char* cx = std::getenv("RL_SAR_CMD_X");
+            const char* cy = std::getenv("RL_SAR_CMD_Y");
+            const char* cyaw = std::getenv("RL_SAR_CMD_YAW");
+            this->control.x = cx ? std::strtof(cx, nullptr) : 0.0f;
+            this->control.y = cy ? std::strtof(cy, nullptr) : 0.0f;
+            this->control.yaw = cyaw ? std::strtof(cyaw, nullptr) : 0.0f;
+            this->control.SetKeyboard(Input::Keyboard::None);
+        }
         this->obs.commands = {this->control.x, this->control.y, this->control.yaw};
         //not currently available for non-ros mujoco version
         // if (this->control.navigation_mode)
@@ -344,6 +360,21 @@ void RL_Sim::RunModel()
         this->obs.dof_vel = this->robot_state.motor_state.dq;
 
         this->obs.actions = this->Forward();
+        if (this->config_name == "go2_ep_student" && mj_data && mj_model && (this->episode_length_buf % 50 == 0))
+        {
+            // Prefer torso/base body height; freejoint qpos[2] can be misleading if model differs.
+            float z = (float)mj_data->qpos[2];
+            int bid = mj_name2id(mj_model, mjOBJ_BODY, "base");
+            if (bid < 0) bid = mj_name2id(mj_model, mjOBJ_BODY, "base_link");
+            if (bid < 0) bid = mj_name2id(mj_model, mjOBJ_BODY, "trunk");
+            if (bid >= 0) z = (float)mj_data->xpos[3 * bid + 2];
+            float amax = 0.0f;
+            for (float a : this->obs.actions) amax = std::max(amax, std::fabs(a));
+            // stderr avoids FSM "\r" line-clear races on stdout
+            std::cerr << "[EP_MUJOCO] t=" << this->episode_length_buf
+                      << " z=" << z << " cmd_x=" << this->control.x
+                      << " amax=" << amax << std::endl;
+        }
         this->ComputeOutput(this->obs.actions, this->output_dof_pos, this->output_dof_vel, this->output_dof_tau);
 
         if (!this->output_dof_pos.empty())
@@ -387,34 +418,16 @@ std::vector<float> RL_Sim::Forward()
     std::vector<float> actions;
 
     // Extreme Parkour Student: TorchScript (obs[753], depth_latent[32]) -> action[12]
+    // MuJoCo has no depth camera: latent=0 every step (no update_interval path here).
     if (this->config_name == "go2_ep_student")
     {
-        const int n_obs = 753;
-        const int n_latent = 32;
-        std::vector<float> ep_obs(n_obs, 0.0f);
-        // Pack a minimal proprio-like prefix from available state (not full EP layout).
-        // Indices follow EP checklist loosely for ang_vel / joint errors so the graph runs.
-        if (this->obs.ang_vel.size() >= 3)
-        {
-            ep_obs[0] = this->obs.ang_vel[0] * 0.25f;
-            ep_obs[1] = this->obs.ang_vel[1] * 0.25f;
-            ep_obs[2] = this->obs.ang_vel[2] * 0.25f;
-        }
-        ep_obs[10] = this->control.x; // cmd vx
-        ep_obs[11] = 1.0f; // terrain one-hot parkour-ish
-        ep_obs[12] = 0.0f;
-        auto default_pos = this->params.Get<std::vector<float>>("default_dof_pos");
-        for (int i = 0; i < 12 && i < (int)this->obs.dof_pos.size(); ++i)
-        {
-            float q0 = (i < (int)default_pos.size()) ? default_pos[i] : 0.0f;
-            ep_obs[13 + i] = (this->obs.dof_pos[i] - q0) * 1.0f;
-            if (i < (int)this->obs.dof_vel.size())
-                ep_obs[25 + i] = this->obs.dof_vel[i] * 0.05f;
-            if (i < (int)this->obs.actions.size())
-                ep_obs[37 + i] = this->obs.actions[i];
-        }
-        std::vector<float> depth_latent(n_latent, 0.0f); // no depth camera in stock MuJoCo go2
+        std::vector<float> ep_obs = this->BuildEpObservation();
+        std::vector<float> depth_latent(32, 0.0f);
         actions = this->model->forward({ep_obs, depth_latent});
+        if ((int)actions.size() >= 12)
+        {
+            this->ep_last_action_.assign(actions.begin(), actions.begin() + 12);
+        }
     }
     else
     {
@@ -439,6 +452,102 @@ std::vector<float> RL_Sim::Forward()
     {
         return actions;
     }
+}
+
+
+std::vector<float> RL_Sim::BuildEpObservation()
+{
+    // EP proprio (53): ang_vel(3), imu roll/pitch(2), yaw slots(3), cmd slots(3),
+    // terrain one-hots(2), dof_pos(12), dof_vel(12), last_action(12), contact(4)
+    // Then scan(132)=0, priv_explicit(9)=0 (JIT estimator overwrites), priv_latent(29)=0,
+    // history(10*53). dof_* already in policy order via joint_mapping.
+    std::vector<float> proprio(EP_N_PROPRIO, 0.0f);
+
+    float ang_scale = 0.25f;
+    float dof_pos_scale = 1.0f;
+    float dof_vel_scale = 0.05f;
+    try { ang_scale = this->params.Get<float>("ang_vel_scale"); } catch (...) {}
+    try { dof_pos_scale = this->params.Get<float>("dof_pos_scale"); } catch (...) {}
+    try { dof_vel_scale = this->params.Get<float>("dof_vel_scale"); } catch (...) {}
+
+    if (this->obs.ang_vel.size() >= 3)
+    {
+        proprio[0] = this->obs.ang_vel[0] * ang_scale;
+        proprio[1] = this->obs.ang_vel[1] * ang_scale;
+        proprio[2] = this->obs.ang_vel[2] * ang_scale;
+    }
+
+    // roll / pitch from base quaternion (wxyz)
+    if (this->obs.base_quat.size() >= 4)
+    {
+        std::vector<float> euler = QuaternionToEuler(this->obs.base_quat);
+        proprio[3] = euler[0]; // roll
+        proprio[4] = euler[1]; // pitch
+    }
+
+    // indices 5,6,7 = yaw deltas — without depth camera leave 0 (evaluate overwrites 6:8 from depth yaw)
+    // commands: 8,9 masked 0; 10 = vx
+    proprio[10] = this->control.x;
+    // MuJoCo stock scene is flat ground → parkour_flat one-hot (env_class==17)
+    // Override with RL_SAR_EP_TERRAIN=parkour for non-flat scenes.
+    const char* terr = std::getenv("RL_SAR_EP_TERRAIN");
+    bool flat = !(terr && std::string(terr) == "parkour");
+    proprio[11] = flat ? 0.0f : 1.0f;
+    proprio[12] = flat ? 1.0f : 0.0f;
+
+    auto default_pos = this->params.Get<std::vector<float>>("default_dof_pos");
+    if (this->ep_last_action_.size() != 12)
+        this->ep_last_action_.assign(12, 0.0f);
+
+    for (int i = 0; i < 12; ++i)
+    {
+        float q0 = (i < (int)default_pos.size()) ? default_pos[i] : 0.0f;
+        float q = (i < (int)this->obs.dof_pos.size()) ? this->obs.dof_pos[i] : q0;
+        float dq = (i < (int)this->obs.dof_vel.size()) ? this->obs.dof_vel[i] : 0.0f;
+        proprio[13 + i] = (q - q0) * dof_pos_scale;
+        proprio[25 + i] = dq * dof_vel_scale;
+        proprio[37 + i] = this->ep_last_action_[i];
+    }
+    // contact unknown in stock MuJoCo → 0 (= contact_filt.float()-0.5 mid); use -0.5 (no contact)
+    for (int i = 0; i < 4; ++i)
+        proprio[49 + i] = -0.5f;
+
+    // history: mask yaw slots like EP (indices 6:8 = 0) before pushing
+    std::vector<float> hist_frame = proprio;
+    hist_frame[6] = 0.0f;
+    hist_frame[7] = 0.0f;
+
+    if (!this->ep_hist_ready_ || (int)this->ep_proprio_hist_.size() != EP_HIST_LEN * EP_N_PROPRIO)
+    {
+        this->ep_proprio_hist_.assign(EP_HIST_LEN * EP_N_PROPRIO, 0.0f);
+        for (int h = 0; h < EP_HIST_LEN; ++h)
+            std::copy(hist_frame.begin(), hist_frame.end(), this->ep_proprio_hist_.begin() + h * EP_N_PROPRIO);
+        this->ep_hist_ready_ = true;
+    }
+    else
+    {
+        // drop oldest, append newest
+        std::copy(this->ep_proprio_hist_.begin() + EP_N_PROPRIO, this->ep_proprio_hist_.end(), this->ep_proprio_hist_.begin());
+        std::copy(hist_frame.begin(), hist_frame.end(), this->ep_proprio_hist_.end() - EP_N_PROPRIO);
+    }
+
+    std::vector<float> ep_obs(EP_N_OBS, 0.0f);
+    // current proprio (with live yaw slots — zeros here)
+    std::copy(proprio.begin(), proprio.end(), ep_obs.begin());
+    // scan zeros already
+    // priv_explicit / priv_latent zeros — JIT estimator fills priv_explicit
+    const int hist_off = EP_N_PROPRIO + EP_N_SCAN + EP_N_PRIV_E + EP_N_PRIV_L;
+    std::copy(this->ep_proprio_hist_.begin(), this->ep_proprio_hist_.end(), ep_obs.begin() + hist_off);
+
+    // clip_obs
+    float clip = 100.0f;
+    try { clip = this->params.Get<float>("clip_obs"); } catch (...) {}
+    for (float &v : ep_obs)
+    {
+        if (v > clip) v = clip;
+        if (v < -clip) v = -clip;
+    }
+    return ep_obs;
 }
 
 void RL_Sim::Plot()
