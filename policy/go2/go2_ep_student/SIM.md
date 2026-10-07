@@ -53,6 +53,8 @@ Uses Extreme Parkour Go2 sim + this sidecar’s JIT/vision (same weights as depl
 source /home/yihan/extreme-parkour/activate.sh
 cd /home/yihan/extreme-parkour/rest271828-rl_sar
 python policy/go2/go2_ep_student/sim_isaac_bridge.py --steps 200 --num-envs 4
+# longer / parkour + evaluate-like summary (MXD_proxy = waypoints/7):
+python policy/go2/go2_ep_student/sim_isaac_bridge.py --steps 800 --num-envs 16 --terrain parkour
 ```
 
 ### Next sim gap (not this change)
