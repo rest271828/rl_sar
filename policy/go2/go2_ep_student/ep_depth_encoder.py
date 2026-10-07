@@ -1,10 +1,12 @@
 """Minimal Extreme Parkour depth encoder for offline / sidecar deploy.
 
-Copied architecture from rsl_rl.modules.depth_backbone (RecurrentDepthBackbone +
-DepthOnlyFCBackbone58x87) so this policy slot does not import Isaac Gym.
+Architecture matches rsl_rl.modules.depth_backbone.RecurrentDepthBackbone +
+DepthOnlyFCBackbone58x87. Supports batched envs with per-env GRU hidden reset.
 """
 
 from __future__ import annotations
+
+from typing import Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
@@ -48,7 +50,8 @@ class RecurrentDepthBackbone(nn.Module):
         )
         self.rnn = nn.GRU(input_size=32, hidden_size=512, batch_first=True)
         self.output_mlp = nn.Sequential(nn.Linear(512, 32 + 2), nn.Tanh())
-        self.hidden_states = None
+        # GRU hidden: [num_layers, batch, hidden_size] — batch == num_envs
+        self.hidden_states: Optional[torch.Tensor] = None
 
     def forward(self, depth_image: torch.Tensor, proprioception: torch.Tensor) -> torch.Tensor:
         depth_feat = self.base_backbone(depth_image)
@@ -57,4 +60,20 @@ class RecurrentDepthBackbone(nn.Module):
         return self.output_mlp(depth_latent.squeeze(1))
 
     def reset_hidden(self) -> None:
+        """Clear all env hiddens (e.g. cold start)."""
         self.hidden_states = None
+
+    def reset_hidden_envs(self, env_ids: Union[torch.Tensor, Sequence[int]]) -> None:
+        """Zero GRU hidden for selected envs only (episode reset)."""
+        if self.hidden_states is None:
+            return
+        if isinstance(env_ids, torch.Tensor):
+            if env_ids.numel() == 0:
+                return
+            ids = env_ids.long().to(self.hidden_states.device).view(-1)
+        else:
+            if len(env_ids) == 0:
+                return
+            ids = torch.as_tensor(env_ids, device=self.hidden_states.device, dtype=torch.long)
+        # hidden_states: [1, num_envs, 512]
+        self.hidden_states[:, ids, :] = 0.0

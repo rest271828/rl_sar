@@ -54,7 +54,9 @@ source /home/yihan/extreme-parkour/activate.sh
 cd /home/yihan/extreme-parkour/rest271828-rl_sar
 python policy/go2/go2_ep_student/sim_isaac_bridge.py --steps 200 --num-envs 4
 # longer / parkour + evaluate-like summary (MXD_proxy = waypoints/7):
-python policy/go2/go2_ep_student/sim_isaac_bridge.py --steps 800 --num-envs 16 --terrain parkour
+python policy/go2/go2_ep_student/sim_isaac_bridge.py --backend jit --steps 1500 --num-envs 192 --terrain parkour
+# evaluate-parity (depth_actor from ckpt):
+python policy/go2/go2_ep_student/sim_isaac_bridge.py --backend ckpt --steps 1500 --num-envs 192 --terrain parkour
 ```
 
 ### Next sim gap (not this change)
