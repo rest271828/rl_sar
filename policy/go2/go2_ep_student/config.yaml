@@ -1,0 +1,70 @@
+# Extreme Parkour Go2 Student (922-10 / model_59500) — rl_sar policy slot
+# Does NOT replace himloco / robot_lab. FSM integration is a follow-up;
+# offline dry-run: python policy/go2/go2_ep_student/infer_offline.py
+#
+# NOTE: stock rl_sar TorchModel::forward is single-input. This policy needs
+# (obs[753], depth_latent[32]) plus a separate depth GRU. Use the Python
+# sidecar until Forward() is extended.
+
+go2/go2_ep_student:
+  # Dual artifacts (paths relative to this directory, or absolute)
+  model_name: "base_jit.pt"          # TorchScript: (obs, depth_latent) -> action[12]
+  vision_weight_name: "vision_weight.pt"  # state_dict for RecurrentDepthBackbone
+  # Default absolute fallbacks used by infer_offline.py if local copies absent:
+  #   .../extreme-parkour-repro/legged_gym/logs/parkour_new/922-10-GO2-STUDENT-D0/traced/
+  #     922-10-GO2-STUDENT-D0-59500-base_jit.pt
+  #     922-10-GO2-STUDENT-D0-59500-vision_weight.pt
+
+  num_observations: 753
+  obs_layout: "proprio53|scandots132|priv_explicit9|priv_latent29|history530"
+  n_proprio: 53
+  n_scan: 132
+  n_priv_explicit: 9
+  n_priv_latent: 29
+  history_len: 10
+  depth_latent_dim: 32
+  depth_yaw_dim: 2
+  depth_input_hw: [58, 87]   # H, W after preprocess
+  depth_update_every_policy_steps: 5
+  depth_buffer_index: -2     # match training; do not silently switch to -1
+  depth_yaw_scale: 1.5
+  observations: ["ep_student_753"]  # not compatible with stock ComputeObservation terms
+  observations_history: []
+  observations_history_priority: "time"
+  clip_obs: 100.0
+  clip_actions_lower: [-4.8, -4.8, -4.8,
+                       -4.8, -4.8, -4.8,
+                       -4.8, -4.8, -4.8,
+                       -4.8, -4.8, -4.8]
+  clip_actions_upper: [4.8, 4.8, 4.8,
+                       4.8, 4.8, 4.8,
+                       4.8, 4.8, 4.8,
+                       4.8, 4.8, 4.8]
+  rl_kp: [40, 40, 40,
+          40, 40, 40,
+          40, 40, 40,
+          40, 40, 40]
+  rl_kd: [1, 1, 1,
+          1, 1, 1,
+          1, 1, 1,
+          1, 1, 1]
+  # Keep base.yaml fixed gains for stand-up; RL gains above for Student
+  num_of_dofs: 12
+  # EP uses scalar 0.25; expand for rl_sar vector multiply
+  action_scale: [0.25, 0.25, 0.25,
+                 0.25, 0.25, 0.25,
+                 0.25, 0.25, 0.25,
+                 0.25, 0.25, 0.25]
+  wheel_indices: []
+  ang_vel_scale: 0.25
+  dof_pos_scale: 1.0
+  dof_vel_scale: 0.05
+  # Unitree order FR,FL,RR,RL — policy output is already Unitree; identity map
+  default_dof_pos: [ -0.1, 0.7, -1.5,
+                      0.1, 0.7, -1.5,
+                     -0.1, 1.0, -1.5,
+                      0.1, 1.0, -1.5]
+  joint_mapping: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+  control_hz: 50
+  exptid: "922-10-GO2-STUDENT-D0"
+  checkpoint: 59500
