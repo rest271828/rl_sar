@@ -7,29 +7,28 @@ New policy slot under `policy/go2/`. **Does not overwrite** `himloco` or `robot_
 - **Weights:** EP Student `922-10-GO2-STUDENT-D0` / `model_59500`
   - `base_jit.pt` — TorchScript `(obs[753], depth_latent[32]) → action[12]`
   - `vision_weight.pt` — `depth_encoder_state_dict` (GRU, not traced)
-- **Offline proof:** `infer_offline.py` loads both and runs dummy depth+obs on CPU/GPU.
-- **Not yet:** ROS topics, FSM state, or torque to the robot.
+- **Offline proof:** `infer_offline.py` — dummy depth+obs, no robot.
+- **Sim proof:** `sim_isaac_bridge.py` — Isaac Gym Go2 closed-loop with the sidecar (see `SIM.md`).
+- **Not yet:** Gazebo/MuJoCo FSM hookup, ROS topics, real robot.
 
-## Dry-run (no robot)
+## Quick commands
 
 ```bash
-cd /home/yihan/extreme-parkour/rest271828-rl_sar
 source /home/yihan/extreme-parkour/activate.sh
+cd /home/yihan/extreme-parkour/rest271828-rl_sar
+
+# dummy dry-run
 python policy/go2/go2_ep_student/infer_offline.py
+
+# sim closed-loop (Isaac Gym; rl_sar Gazebo unavailable on bare cs2)
+python policy/go2/go2_ep_student/sim_isaac_bridge.py --steps 200 --num-envs 4
 ```
 
-Optional: copy/symlink traced files into this directory as `base_jit.pt` and `vision_weight.pt`, or pass `--base-jit` / `--vision-weight`.
+## Stock rl_sar Go2 sim (other policies)
 
-## Why Python sidecar first
+```text
+roslaunch rl_sar gazebo.launch rname:=go2   # then rosrun rl_sar rl_sim → himloco
+./cmake_build/bin/rl_sim_mujoco go2 scene
+```
 
-Stock `InferenceRuntime::TorchModel::forward` feeds a **single** obs tensor. EP needs **two** tensors plus a live GRU. Full C++/FSM hookup requires a custom `Forward()` (see upstream README: customize `rl_real_<ROBOT>.cpp`) and a 753-dim observation builder incompatible with himloco’s 45-dim terms.
-
-## Next steps (ROS / FSM)
-
-1. Add `RLFSMStateEPStudent` (or make locomotion `config_name` selectable) — never replace himloco files.
-2. Extend Go2 `Forward()` to: preprocess depth → encoder → write yaw into obs[6:8] → `jit(obs, latent)`.
-3. Wire RealSense/Go2 depth → crop/resize `(87,58)` → same normalize as training; buffer index **`-2`**.
-4. Enforce clip **±4.8**, `action_scale` **0.25**, PD **40/1**, 50 Hz.
-5. Machine-side dry-run (log actions, no torque) → tethered flat ground.
-
-Contract table (project docs): `ep-student-vs-rl-sar-contract.md`.
+Details and gaps: **SIM.md**. Contract: project doc `ep-student-vs-rl-sar-contract.md`.
