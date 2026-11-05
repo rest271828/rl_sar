@@ -60,6 +60,10 @@ class LatestFrame:
             w, h = self._wh
             return self._buf, w, h, self._stamp_ns, self._seq
 
+    def seq(self) -> int:
+        with self._lock:
+            return self._seq
+
 
 def pack_frame(payload: bytes, w: int, h: int, stamp_ns: int) -> bytes:
     header = MAGIC + struct.pack("<IIIQ", VERSION, w, h, stamp_ns)
@@ -70,13 +74,16 @@ def serve(bind: str, port: int, latest: LatestFrame, min_period_s: float) -> Non
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((bind, port))
-    srv.listen(1)
+    srv.listen(4)
     print(f"[bridge] listening on {bind}:{port}", flush=True)
     while True:
         conn, addr = srv.accept()
         print(f"[bridge] client {addr}", flush=True)
         last_seq = -1
+        last_send = 0.0
+        frames_sent = 0
         try:
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             with conn:
                 while True:
                     item = latest.get()
@@ -84,15 +91,27 @@ def serve(bind: str, port: int, latest: LatestFrame, min_period_s: float) -> Non
                         time.sleep(0.01)
                         continue
                     payload, w, h, stamp_ns, seq = item
-                    if seq == last_seq:
+                    now = time.time()
+                    # Prefer new frames; also resend latest every 0.2s so clients
+                    # do not block forever if ROS stalls briefly.
+                    if seq == last_seq and (now - last_send) < max(0.2, min_period_s):
                         time.sleep(0.005)
                         continue
+                    if min_period_s > 0 and (now - last_send) < min_period_s and seq != last_seq:
+                        # rate-limit new frames
+                        time.sleep(0.001)
+                        continue
                     last_seq = seq
+                    last_send = now
                     conn.sendall(pack_frame(payload, w, h, stamp_ns))
-                    if min_period_s > 0:
-                        time.sleep(min_period_s)
+                    frames_sent += 1
+                    if frames_sent <= 3 or frames_sent % 30 == 0:
+                        print(
+                            f"[bridge] sent frame#{frames_sent} {w}x{h} seq={seq}",
+                            flush=True,
+                        )
         except (BrokenPipeError, ConnectionResetError, OSError) as e:
-            print(f"[bridge] client gone: {e}", flush=True)
+            print(f"[bridge] client gone after {frames_sent} frames: {e}", flush=True)
 
 
 def main() -> int:
@@ -112,17 +131,29 @@ def main() -> int:
     thr.start()
 
     import rclpy
+    from rclpy.executors import MultiThreadedExecutor
     from rclpy.node import Node
-    from rclpy.qos import qos_profile_sensor_data
+    from rclpy.qos import (
+        DurabilityPolicy,
+        HistoryPolicy,
+        QoSProfile,
+        ReliabilityPolicy,
+    )
     from sensor_msgs.msg import Image
 
     class DepthNode(Node):
         def __init__(self) -> None:
             super().__init__("ep_depth_tcp_bridge")
-            self.create_subscription(
-                Image, args.topic, self._cb, qos_profile_sensor_data
+            qos = QoSProfile(
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=5,
+                durability=DurabilityPolicy.VOLATILE,
             )
-            self.get_logger().info(f"subscribing {args.topic}")
+            self._n = 0
+            self.create_subscription(Image, args.topic, self._cb, qos)
+            self.create_timer(2.0, self._heartbeat)
+            self.get_logger().info(f"subscribing {args.topic} BEST_EFFORT keep_last=5")
 
         def _cb(self, msg: Image) -> None:
             if msg.encoding not in ("16UC1", "mono16"):
@@ -133,19 +164,28 @@ def main() -> int:
             if arr.size < w * h:
                 self.get_logger().warn(f"short image {arr.size} < {w * h}")
                 return
-            arr = np.asarray(arr[: w * h]).reshape(h, w)
+            arr = np.asarray(arr[: w * h]).reshape(h, w).copy()
             stamp_ns = int(msg.header.stamp.sec) * 1_000_000_000 + int(
                 msg.header.stamp.nanosec
             )
             latest.set(arr, stamp_ns)
+            self._n += 1
+            if self._n <= 5 or self._n % 60 == 0:
+                self.get_logger().info(f"depth cb #{self._n} {w}x{h}")
+
+        def _heartbeat(self) -> None:
+            self.get_logger().info(f"heartbeat cbs={self._n} seq={latest.seq()}")
 
     rclpy.init()
     node = DepthNode()
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
     return 0
