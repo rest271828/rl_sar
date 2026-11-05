@@ -39,6 +39,8 @@ RL_Real::RL_Real(int argc, char **argv)
     this->ang_vel_axis = "body";
     this->robot_name = wheel_mode ? "go2w" : "go2";
     this->ReadYaml(this->robot_name, "base.yaml");
+    // Freeze GetUp/GetDown targets+gains before any policy InitRL merges EP/himloco yaml.
+    this->CacheStandParamsFromBase();
 
     // auto load FSM by robot_name
     if (FSMManager::GetInstance().IsTypeSupported(this->robot_name))
@@ -95,6 +97,7 @@ RL_Real::RL_Real(int argc, char **argv)
     }
 
     this->InitEpDepthBridge();
+    this->runtime_log_.StartIfEnabled();
 
     // loop
     this->loop_keyboard = std::make_shared<LoopFunc>("loop_keyboard", 0.05, std::bind(&RL_Real::KeyboardInterface, this));
@@ -127,6 +130,7 @@ RL_Real::~RL_Real()
 #ifdef PLOT
     this->loop_plot->shutdown();
 #endif
+    this->runtime_log_.Stop();
     std::cout << LOGGER::INFO << "RL_Real exit" << std::endl;
 }
 
@@ -379,6 +383,44 @@ void RL_Real::RobotControl()
     this->GetState(&this->robot_state);
 
     this->StateController(&this->robot_state, &this->robot_command);
+
+    if (this->runtime_log_.enabled())
+    {
+        Go2LogSample s;
+        s.t_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        s.motiontime = this->motiontime;
+        const std::string fsm_name =
+            (this->fsm.current_state_) ? this->fsm.current_state_->GetStateName() : "none";
+        std::snprintf(s.fsm, sizeof(s.fsm), "%s", fsm_name.c_str());
+        const int n = std::min(12, this->params.Get<int>("num_of_dofs"));
+        for (int i = 0; i < n; ++i)
+        {
+            s.q[i] = this->robot_state.motor_state.q[i];
+            s.dq[i] = this->robot_state.motor_state.dq[i];
+            s.q_cmd[i] = this->robot_command.motor_command.q[i];
+            s.kp[i] = this->robot_command.motor_command.kp[i];
+            s.kd[i] = this->robot_command.motor_command.kd[i];
+        }
+        for (int i = 0; i < 3; ++i)
+        {
+            s.gyro[i] = this->robot_state.imu.gyroscope[i];
+        }
+        for (int i = 0; i < 4; ++i)
+        {
+            s.quat[i] = this->robot_state.imu.quaternion[i];
+        }
+        s.cmd_x = this->control.x;
+        s.cmd_y = this->control.y;
+        s.cmd_yaw = this->control.yaw;
+        s.rl_init_done = this->rl_init_done ? 1 : 0;
+        s.ep_have_depth = this->ep_have_depth_frame_ ? 1 : 0;
+        s.ep_depth_fresh = this->ep_depth_fresh_.load() ? 1 : 0;
+        s.config_is_ep = (this->config_name == "go2_ep_student") ? 1 : 0;
+        this->runtime_log_.TryPush(s);
+    }
 
     this->control.ClearInput();
 

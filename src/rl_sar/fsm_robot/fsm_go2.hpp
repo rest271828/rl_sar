@@ -84,15 +84,19 @@ public:
 
     void Run() override
     {
+        // Always stand to base.yaml targets (not EP/himloco default_dof_pos after InitRL).
+        const auto &stand_pos = !rl.stand_default_dof_pos.empty()
+                                    ? rl.stand_default_dof_pos
+                                    : rl.params.Get<std::vector<float>>("default_dof_pos");
         if(stand_from_passive)
         {
 
             if (Interpolate(percent_pre_getup, rl.now_state.motor_state.q, pre_running_pos, 1.0f, "Pre Getting up", true)) return;
-            if (Interpolate(percent_getup, pre_running_pos, rl.params.Get<std::vector<float>>("default_dof_pos"), 2.0f, "Getting up", true)) return;
+            if (Interpolate(percent_getup, pre_running_pos, stand_pos, 2.0f, "Getting up", true)) return;
         }
         else
         {
-            if (Interpolate(percent_getup, rl.now_state.motor_state.q, rl.params.Get<std::vector<float>>("default_dof_pos"), 1.0f, "Getting up", true)) return;
+            if (Interpolate(percent_getup, rl.now_state.motor_state.q, stand_pos, 1.0f, "Getting up", true)) return;
         }
     }
 

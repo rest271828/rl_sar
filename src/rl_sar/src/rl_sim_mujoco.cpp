@@ -84,6 +84,7 @@ RL_Sim::RL_Sim(int argc, char **argv)
 
     // read params from yaml
     this->ReadYaml(this->robot_name, "base.yaml");
+    this->CacheStandParamsFromBase();
 
     // auto load FSM by robot_name
     if (FSMManager::GetInstance().IsTypeSupported(this->robot_name))

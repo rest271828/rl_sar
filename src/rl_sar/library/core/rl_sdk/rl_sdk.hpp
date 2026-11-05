@@ -220,6 +220,9 @@ public:
 
     // yaml params
     void ReadYaml(const std::string& file_path, const std::string& file_name);
+    // Snapshot stand targets/gains from base.yaml so GetUp/GetDown keep working
+    // after InitRL merges a policy config (e.g. go2_ep_student) into params.
+    void CacheStandParamsFromBase();
 
     // csv logger
     std::string csv_filename;
@@ -233,6 +236,11 @@ public:
     // history buffer
     ObservationBuffer history_obs_buf;
     std::vector<float> history_obs;
+
+    // Stand / GetUp / GetDown (always from base.yaml; not overwritten by policy InitRL)
+    std::vector<float> stand_default_dof_pos;
+    std::vector<float> stand_fixed_kp;
+    std::vector<float> stand_fixed_kd;
 
     // others
     int motiontime = 0;
