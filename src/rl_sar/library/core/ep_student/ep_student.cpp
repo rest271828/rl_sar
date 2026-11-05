@@ -560,6 +560,15 @@ std::vector<float> BuildObservation(const ProprioInput &in, HistState &hist)
     return ep_obs;
 }
 
+namespace
+{
+uint64_t MonoNs()
+{
+    using namespace std::chrono;
+    return static_cast<uint64_t>(duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count());
+}
+} // namespace
+
 struct DepthTcpClient::Impl
 {
     std::string host;
@@ -571,11 +580,14 @@ struct DepthTcpClient::Impl
     std::vector<uint16_t> latest;
     int w = 0;
     int h = 0;
-    uint64_t stamp_ns = 0;
+    uint64_t wire_stamp_ns = 0;
+    uint64_t effective_stamp_ns = 0;
+    uint64_t recv_ns = 0;
     uint64_t seq = 0;
-    uint64_t last_got_seq = 0;
-    uint64_t last_accepted_stamp_ns = 0;
-    uint64_t rejected_nonincreasing = 0;
+    uint64_t last_wire_stamp = 0;
+    uint64_t last_effective_stamp = 0;
+    uint64_t last_recv_ns = 0;
+    int log_accepts_left = 8;
 };
 
 DepthTcpClient::DepthTcpClient() : impl_(new Impl) {}
@@ -586,6 +598,12 @@ DepthTcpClient::~DepthTcpClient()
 }
 
 bool DepthTcpClient::Connected() const { return impl_->connected.load(); }
+
+uint64_t DepthTcpClient::Seq() const
+{
+    std::lock_guard<std::mutex> lock(impl_->mu);
+    return impl_->seq;
+}
 
 void DepthTcpClient::Start(const std::string &host, int port)
 {
@@ -620,6 +638,12 @@ void DepthTcpClient::Start(const std::string &host, int port)
                 continue;
             }
             impl_->connected = true;
+            {
+                std::lock_guard<std::mutex> lock(impl_->mu);
+                impl_->last_wire_stamp = 0;
+                impl_->last_effective_stamp = 0;
+                impl_->last_recv_ns = 0;
+            }
             std::cout << "[EP_DEPTH_TCP] connected to " << impl_->host << ":" << impl_->port << std::endl;
 
             while (impl_->run.load())
@@ -633,7 +657,7 @@ void DepthTcpClient::Start(const std::string &host, int port)
                 const uint32_t ver = ReadU32LE(hdr + 4);
                 const uint32_t w = ReadU32LE(hdr + 8);
                 const uint32_t h = ReadU32LE(hdr + 12);
-                const uint64_t stamp = ReadU64LE(hdr + 16);
+                const uint64_t wire = ReadU64LE(hdr + 16);
                 if (magic != kDepthProtoMagic || ver != kDepthProtoVersion || w == 0 || h == 0 ||
                     w > 4096 || h > 4096)
                 {
@@ -646,28 +670,49 @@ void DepthTcpClient::Start(const std::string &host, int port)
                 {
                     break;
                 }
+                const uint64_t now = MonoNs();
                 {
                     std::lock_guard<std::mutex> lock(impl_->mu);
-                    // Reject keepalive / replay frames whose ROS stamp did not advance.
-                    if (stamp <= impl_->last_accepted_stamp_ns)
+                    const bool stamp_up = wire > impl_->last_wire_stamp;
+                    const bool recv_advanced = now > impl_->last_recv_ns;
+                    // Accept if stamp increased OR this is a new TCP packet with newer recv time
+                    // (covers frozen ROS stamps). Stamp rollback = bridge restart; also accept.
+                    if (!stamp_up && !recv_advanced)
                     {
-                        impl_->rejected_nonincreasing += 1;
-                        if (impl_->rejected_nonincreasing <= 5 ||
-                            impl_->rejected_nonincreasing % 60 == 0)
-                        {
-                            std::cerr << "[EP_DEPTH_TCP] reject non-increasing stamp_ns=" << stamp
-                                      << " last_accepted=" << impl_->last_accepted_stamp_ns
-                                      << " (count=" << impl_->rejected_nonincreasing << ")"
-                                      << std::endl;
-                        }
                         continue;
+                    }
+                    uint64_t effective = wire;
+                    if (!stamp_up)
+                    {
+                        effective = now;
+                    }
+                    if (effective <= impl_->last_effective_stamp)
+                    {
+                        effective = impl_->last_effective_stamp + 1;
                     }
                     impl_->latest.swap(frame);
                     impl_->w = static_cast<int>(w);
                     impl_->h = static_cast<int>(h);
-                    impl_->stamp_ns = stamp;
-                    impl_->last_accepted_stamp_ns = stamp;
+                    impl_->wire_stamp_ns = wire;
+                    impl_->effective_stamp_ns = effective;
+                    impl_->recv_ns = now;
+                    impl_->last_wire_stamp = wire;
+                    impl_->last_effective_stamp = effective;
+                    impl_->last_recv_ns = now;
                     impl_->seq += 1;
+                    const bool frozen = !stamp_up;
+                    if (impl_->log_accepts_left > 0 || (impl_->seq % 30 == 0))
+                    {
+                        if (impl_->log_accepts_left > 0)
+                        {
+                            --impl_->log_accepts_left;
+                        }
+                        std::cerr << "[EP_DEPTH] tcp frame " << w << "x" << h
+                                  << " stamp_ns=" << effective
+                                  << " wire_stamp_ns=" << wire
+                                  << " seq=" << impl_->seq
+                                  << " frozen_ros=" << (frozen ? 1 : 0) << std::endl;
+                    }
                 }
             }
             ::close(fd);
@@ -688,19 +733,54 @@ void DepthTcpClient::Stop()
     impl_->connected = false;
 }
 
-bool DepthTcpClient::TryGetLatestMm(std::vector<uint16_t> &out_mm, int &w, int &h, uint64_t &stamp_ns)
+bool DepthTcpClient::TryGetLatestMm(std::vector<uint16_t> &out_mm, int &w, int &h, uint64_t &stamp_ns) const
+{
+    uint64_t recv_ns = 0;
+    uint64_t seq = 0;
+    return TryGetLatestMm(out_mm, w, h, stamp_ns, recv_ns, seq);
+}
+
+bool DepthTcpClient::TryGetLatestMm(std::vector<uint16_t> &out_mm, int &w, int &h,
+                                   uint64_t &stamp_ns, uint64_t &recv_ns, uint64_t &seq) const
 {
     std::lock_guard<std::mutex> lock(impl_->mu);
-    if (impl_->seq == impl_->last_got_seq || impl_->latest.empty())
+    if (impl_->seq == 0 || impl_->latest.empty())
     {
         return false;
     }
     out_mm = impl_->latest;
     w = impl_->w;
     h = impl_->h;
-    stamp_ns = impl_->stamp_ns;
-    impl_->last_got_seq = impl_->seq;
+    stamp_ns = impl_->effective_stamp_ns;
+    recv_ns = impl_->recv_ns;
+    seq = impl_->seq;
     return true;
+}
+
+bool DepthTcpClient::PeekLatestMeta(int &w, int &h, uint64_t &stamp_ns, uint64_t &recv_ns, uint64_t &seq) const
+{
+    std::lock_guard<std::mutex> lock(impl_->mu);
+    if (impl_->seq == 0 || impl_->latest.empty())
+    {
+        return false;
+    }
+    w = impl_->w;
+    h = impl_->h;
+    stamp_ns = impl_->effective_stamp_ns;
+    recv_ns = impl_->recv_ns;
+    seq = impl_->seq;
+    return true;
+}
+
+uint64_t DepthTcpClient::LatestRecvAgeNs() const
+{
+    std::lock_guard<std::mutex> lock(impl_->mu);
+    if (impl_->seq == 0 || impl_->recv_ns == 0)
+    {
+        return ~0ull;
+    }
+    const uint64_t now = MonoNs();
+    return now >= impl_->recv_ns ? now - impl_->recv_ns : 0;
 }
 
 } // namespace ep_student

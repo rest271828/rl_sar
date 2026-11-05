@@ -42,6 +42,7 @@ namespace plt = matplotlibcpp;
 
 #include <chrono>
 #include <thread>
+#include <mutex>
 #include <cstring>
 #include <ctime>
 #include <cstdio>
@@ -248,6 +249,16 @@ private:
     void InitEpDepthBridge();
     void MaybeUpdateEpDepthFromBridge(const std::vector<float> &proprio53);
     bool EpTerrainIsFlat() const;
+    void PollEpDepthWarmup() override;
+    bool TryArmEpFirstForward() override;
+    void OnEpLocomotionEnter() override;
+    bool IsEpStudentConfig() const;
+    std::string EpVisionWeightPath() const;
+    void NoteDepthFrame(uint64_t stamp_ns, uint64_t recv_ns, uint64_t seq);
+    bool DepthRecvAgeNs(uint64_t &age_ns) const;
+    void EnsureEpEncoderLoaded();
+    void MaybeEncodeIfLoaded(const std::vector<float> &proprio53);
+    static uint64_t EpMonoNs();
     ep_student::DepthEncoder ep_encoder_;
     ep_student::DepthTcpClient ep_depth_tcp_;
     ep_student::HistState ep_hist_;
@@ -259,8 +270,16 @@ private:
     int ep_policy_step_ = 0;
     bool ep_have_depth_frame_ = false;
     uint64_t ep_last_depth_stamp_ns_ = 0;
+    uint64_t ep_last_encoded_seq_ = 0;
+    uint64_t ep_last_seen_seq_ = 0;
+    uint64_t ep_last_frame_recv_ns_ = 0;
+    uint64_t ep_rl_enter_mono_ns_ = 0;
+    uint64_t ep_last_wait_warn_ns_ = 0;
+    uint64_t ep_last_stale_warn_ns_ = 0;
     bool ep_offline_depth_ = false; // RL_SAR_EP_DEPTH_BIN loaded
     int ep_stale_encode_logs_ = 0;
+    std::once_flag ep_encoder_once_;
+    std::thread ep_encoder_preload_thr_;
     bool dry_run_ = false; // RL_SAR_DRY_RUN=1: no lowcmd / no motion switcher release
     Go2RuntimeLogger runtime_log_;
 

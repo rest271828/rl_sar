@@ -16,6 +16,7 @@
 #include <memory>
 #include <fstream>
 #include <mutex>
+#include <atomic>
 
 #include <yaml-cpp/yaml.h>
 #include "fsm.hpp"
@@ -203,9 +204,14 @@ public:
     RobotState<float> now_state;
     bool rl_init_done = false;
     // When false, FSM should hold stand PD and RunModel must not enqueue policy
-    // targets. EP sets this false until a fresh (stamp-advancing) depth frame
-    // has been accepted; other configs leave it true.
+    // targets. EP sets this false until a recently-received depth frame
+    // (recv_age < 300ms) is available; other configs leave it true.
     std::atomic<bool> policy_output_allowed{true};
+
+    // EP depth warmup / first-Forward gate. No-ops except on RL_Real.
+    virtual void PollEpDepthWarmup() {}
+    virtual bool TryArmEpFirstForward() { return true; }
+    virtual void OnEpLocomotionEnter() {}
 
     // init
     void InitObservations();

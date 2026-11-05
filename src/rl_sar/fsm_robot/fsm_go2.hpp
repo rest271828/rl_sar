@@ -84,6 +84,8 @@ public:
 
     void Run() override
     {
+        // Nonblocking peek so latent/have_depth is warm before press 1. No EnsureLoaded here.
+        rl.PollEpDepthWarmup();
         // Always stand to base.yaml targets (not EP/himloco default_dof_pos after InitRL).
         const auto &stand_pos = !rl.stand_default_dof_pos.empty()
                                     ? rl.stand_default_dof_pos
@@ -179,11 +181,10 @@ public:
         }
         if (rl.config_name == "go2_ep_student")
         {
-            // Gate policy output until a stamp-advancing depth frame is accepted.
-            rl.policy_output_allowed.store(false);
+            rl.OnEpLocomotionEnter();
             std::cout << LOGGER::WARNING
                       << "go2_ep_student: dual-input Forward (753+32). Holding stand PD until "
-                      << "fresh depth (stamp advances). Verify stamp_ns increments / "
+                      << "a depth frame with recv_age < 300ms. Verify stamp_ns increments / "
                       << "ep_depth_fresh before trusting RL. "
                       << "Depth: RL_SAR_EP_DEPTH_HOST or RL_SAR_EP_DEPTH_BIN." << std::endl;
         }
@@ -209,10 +210,10 @@ public:
     {
         if (!rl.rl_init_done) rl.rl_init_done = true;
 
-        // EP: keep base.yaml stand PD until fresh depth arms the policy, then a short
-        // position blend to EP default_dof_pos still using stand gains (does not change
-        // rl_kp/rl_kd used once RLControl starts).
-        if (rl.config_name == "go2_ep_student" && !rl.policy_output_allowed.load())
+        // EP: keep base.yaml stand PD until a recently received depth frame arms the
+        // policy, then a short position blend to EP default_dof_pos still using stand
+        // gains (does not change rl_kp/rl_kd used once RLControl starts).
+        if (rl.config_name == "go2_ep_student" && !rl.TryArmEpFirstForward())
         {
             const auto &stand_pos = !rl.stand_default_dof_pos.empty()
                                         ? rl.stand_default_dof_pos
@@ -231,14 +232,6 @@ public:
                 fsm_command->motor_command.kd[i] = kd[i];
                 fsm_command->motor_command.tau[i] = 0;
             }
-            static int wait_logs = 0;
-            if (wait_logs < 3 || wait_logs % 100 == 0)
-            {
-                std::cout << LOGGER::WARNING
-                          << "[EP_DEPTH] waiting for fresh depth before first Forward; holding stand PD"
-                          << std::endl;
-            }
-            ++wait_logs;
             return;
         }
 

@@ -110,9 +110,14 @@ public:
     void Start(const std::string &host, int port);
     void Stop();
 
-    // Returns true if a newer frame was copied into out_mm (size w*h).
-    bool TryGetLatestMm(std::vector<uint16_t> &out_mm, int &w, int &h, uint64_t &stamp_ns);
-
+    // PEEK: copy latest frame without consuming seq. stamp_ns is the effective
+    // (never-decreasing) stamp. Returns false if no frame has been accepted yet.
+    bool TryGetLatestMm(std::vector<uint16_t> &out_mm, int &w, int &h, uint64_t &stamp_ns) const;
+    bool TryGetLatestMm(std::vector<uint16_t> &out_mm, int &w, int &h,
+                       uint64_t &stamp_ns, uint64_t &recv_ns, uint64_t &seq) const;
+    bool PeekLatestMeta(int &w, int &h, uint64_t &stamp_ns, uint64_t &recv_ns, uint64_t &seq) const;
+    uint64_t LatestRecvAgeNs() const; // ~0ull if no frame
+    uint64_t Seq() const;
     bool Connected() const;
 
 private:

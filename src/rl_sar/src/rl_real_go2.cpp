@@ -8,6 +8,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <mutex>
+#include <chrono>
+#include <string>
 
 RL_Real::RL_Real(int argc, char **argv)
 {
@@ -124,6 +127,10 @@ RL_Real::RL_Real(int argc, char **argv)
 RL_Real::~RL_Real()
 {
     this->ep_depth_tcp_.Stop();
+    if (this->ep_encoder_preload_thr_.joinable())
+    {
+        this->ep_encoder_preload_thr_.join();
+    }
     this->loop_keyboard->shutdown();
     this->loop_control->shutdown();
     this->loop_rl->shutdown();
@@ -202,6 +209,219 @@ void RL_Real::InitEpDepthBridge()
                   << "[EP_DEPTH] no RL_SAR_EP_DEPTH_HOST; latent stays 0 until TCP/bin provides depth"
                   << std::endl;
     }
+    if (this->IsEpStudentConfig() && !this->ep_encoder_preload_thr_.joinable())
+    {
+        this->ep_encoder_preload_thr_ = std::thread([this]() { this->EnsureEpEncoderLoaded(); });
+    }
+}
+
+namespace
+{
+constexpr uint64_t kEpFreshNs = 200ull * 1000000ull;       // 200ms
+constexpr uint64_t kEpAllowFirstNs = 300ull * 1000000ull;  // 300ms
+constexpr uint64_t kEpHoldGiveUpNs = 2000ull * 1000000ull; // 2s
+constexpr uint64_t kEpWarnPeriodNs = 1000000000ull;        // 1Hz
+constexpr uint64_t kEpStaleNs = 1000ull * 1000000ull;      // 1s
+} // namespace
+
+uint64_t RL_Real::EpMonoNs()
+{
+    using namespace std::chrono;
+    return static_cast<uint64_t>(duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count());
+}
+
+bool RL_Real::IsEpStudentConfig() const
+{
+    if (this->config_name == "go2_ep_student")
+    {
+        return true;
+    }
+    const char *env_cfg = std::getenv("RL_SAR_GO2_CONFIG");
+    return env_cfg && *env_cfg && std::string(env_cfg) == "go2_ep_student";
+}
+
+std::string RL_Real::EpVisionWeightPath() const
+{
+    std::string cfg = this->config_name;
+    if (cfg.empty() || cfg == "himloco")
+    {
+        const char *env_cfg = std::getenv("RL_SAR_GO2_CONFIG");
+        if (env_cfg && *env_cfg)
+        {
+            cfg = env_cfg;
+        }
+    }
+    if (cfg.empty())
+    {
+        cfg = "go2_ep_student";
+    }
+    std::string weight_name = "vision_weight.pt";
+    try
+    {
+        weight_name = this->params.Get<std::string>("vision_weight_name");
+    }
+    catch (...)
+    {
+    }
+    return std::string(POLICY_DIR) + "/" + this->robot_name + "/" + cfg + "/" + weight_name;
+}
+
+void RL_Real::EnsureEpEncoderLoaded()
+{
+    std::call_once(this->ep_encoder_once_, [this]() {
+        try
+        {
+            this->ep_encoder_.EnsureLoaded(this->EpVisionWeightPath());
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "[EP_DEPTH] encoder preload failed: " << e.what() << std::endl;
+        }
+    });
+}
+
+void RL_Real::NoteDepthFrame(uint64_t stamp_ns, uint64_t recv_ns, uint64_t seq)
+{
+    this->ep_have_depth_frame_ = true;
+    this->ep_last_seen_seq_ = seq;
+    this->ep_last_frame_recv_ns_ = recv_ns;
+    this->ep_last_depth_stamp_ns_ = stamp_ns;
+    uint64_t age = 0;
+    if (recv_ns == 0)
+    {
+        this->ep_depth_fresh_ = false;
+        return;
+    }
+    const uint64_t now = EpMonoNs();
+    age = now >= recv_ns ? now - recv_ns : 0;
+    this->ep_depth_fresh_ = (age < kEpFreshNs);
+}
+
+bool RL_Real::DepthRecvAgeNs(uint64_t &age_ns) const
+{
+    if (!this->ep_have_depth_frame_ || this->ep_last_frame_recv_ns_ == 0)
+    {
+        return false;
+    }
+    const uint64_t now = EpMonoNs();
+    age_ns = now >= this->ep_last_frame_recv_ns_ ? now - this->ep_last_frame_recv_ns_ : 0;
+    return true;
+}
+
+void RL_Real::MaybeEncodeIfLoaded(const std::vector<float> &proprio53)
+{
+    if (!this->ep_encoder_.ok || !this->ep_have_depth_frame_)
+    {
+        return;
+    }
+    try
+    {
+        this->ep_encoder_.Encode(this->ep_depth_proc_, proprio53, this->ep_latent_, this->ep_yaw_);
+    }
+    catch (const std::exception &e)
+    {
+        static bool warned = false;
+        if (!warned)
+        {
+            warned = true;
+            std::cerr << "[EP_DEPTH] encoder unavailable, latent stays 0: " << e.what() << std::endl;
+        }
+    }
+}
+
+void RL_Real::PollEpDepthWarmup()
+{
+    if (!this->IsEpStudentConfig() || this->ep_offline_depth_)
+    {
+        return;
+    }
+    int w = 0, h = 0;
+    uint64_t stamp = 0, recv_ns = 0, seq = 0;
+    if (!this->ep_depth_tcp_.PeekLatestMeta(w, h, stamp, recv_ns, seq))
+    {
+        uint64_t age = 0;
+        this->ep_depth_fresh_ = this->DepthRecvAgeNs(age) && age < kEpFreshNs;
+        return;
+    }
+    this->NoteDepthFrame(stamp, recv_ns, seq);
+    if (seq == this->ep_last_encoded_seq_)
+    {
+        return;
+    }
+    if (!this->ep_encoder_.ok)
+    {
+        return; // never EnsureLoaded on the 200Hz GetUp path
+    }
+    std::vector<uint16_t> mm;
+    if (!this->ep_depth_tcp_.TryGetLatestMm(mm, w, h, stamp, recv_ns, seq))
+    {
+        return;
+    }
+    ep_student::PreprocessDepthUint16Mm(mm.data(), h, w, this->ep_depth_proc_);
+    std::vector<float> proprio(ep_student::kNProprio, 0.0f);
+    this->MaybeEncodeIfLoaded(proprio);
+    this->ep_last_encoded_seq_ = seq;
+}
+
+void RL_Real::OnEpLocomotionEnter()
+{
+    this->ep_rl_enter_mono_ns_ = EpMonoNs();
+    this->ep_last_wait_warn_ns_ = 0;
+    if (!this->ep_offline_depth_)
+    {
+        this->policy_output_allowed.store(false);
+    }
+    else
+    {
+        this->policy_output_allowed.store(true);
+    }
+    this->PollEpDepthWarmup();
+}
+
+bool RL_Real::TryArmEpFirstForward()
+{
+    if (this->ep_offline_depth_)
+    {
+        this->policy_output_allowed.store(true);
+        return true;
+    }
+    if (this->policy_output_allowed.load())
+    {
+        return true;
+    }
+    this->PollEpDepthWarmup();
+    uint64_t age = 0;
+    const bool have = this->DepthRecvAgeNs(age);
+    if (have && age < kEpAllowFirstNs)
+    {
+        this->policy_output_allowed.store(true);
+        std::cout << LOGGER::INFO << "[EP_DEPTH] first Forward armed recv_age_ms="
+                  << (age / 1000000ull) << " stamp_ns=" << this->ep_last_depth_stamp_ns_
+                  << " seq=" << this->ep_last_seen_seq_ << std::endl;
+        return true;
+    }
+    const uint64_t now = EpMonoNs();
+    if (this->ep_last_wait_warn_ns_ == 0 || now - this->ep_last_wait_warn_ns_ >= kEpWarnPeriodNs)
+    {
+        this->ep_last_wait_warn_ns_ = now;
+        const uint64_t since_enter =
+            this->ep_rl_enter_mono_ns_ == 0 ? 0 : now - this->ep_rl_enter_mono_ns_;
+        if (!have)
+        {
+            std::cout << LOGGER::WARNING
+                      << (since_enter > kEpHoldGiveUpNs
+                              ? "[EP_DEPTH] waiting for fresh depth before first Forward; holding stand PD (no frame for >2s)"
+                              : "[EP_DEPTH] waiting for fresh depth before first Forward; holding stand PD")
+                      << std::endl;
+        }
+        else
+        {
+            std::cout << LOGGER::WARNING
+                      << "[EP_DEPTH] waiting for fresh depth before first Forward; holding stand PD (frame too old)"
+                      << std::endl;
+        }
+    }
+    return false;
 }
 
 bool RL_Real::EpTerrainIsFlat() const
@@ -225,73 +445,59 @@ bool RL_Real::EpTerrainIsFlat() const
 
 void RL_Real::MaybeUpdateEpDepthFromBridge(const std::vector<float> &proprio53)
 {
-    // Latch clears at each update attempt so CSV sees fresh=1 for ~update_interval.
-    this->ep_depth_fresh_ = false;
-
-    // Pull newest TCP frame into processed cache; reject non-increasing stamps.
     std::vector<uint16_t> mm;
     int w = 0, h = 0;
-    uint64_t stamp = 0;
-    bool got_new = false;
-    if (this->ep_depth_tcp_.TryGetLatestMm(mm, w, h, stamp))
+    uint64_t stamp = 0, recv_ns = 0, seq = 0;
+    const bool got = this->ep_depth_tcp_.TryGetLatestMm(mm, w, h, stamp, recv_ns, seq);
+    if (got)
     {
-        if (stamp <= this->ep_last_depth_stamp_ns_)
-        {
-            static int reject_n = 0;
-            if (reject_n < 5 || reject_n % 60 == 0)
-            {
-                std::cout << LOGGER::WARNING << "[EP_DEPTH] reject non-increasing stamp_ns=" << stamp
-                          << " last=" << this->ep_last_depth_stamp_ns_ << std::endl;
-            }
-            ++reject_n;
-        }
-        else
+        this->NoteDepthFrame(stamp, recv_ns, seq);
+        if (seq != this->ep_last_encoded_seq_)
         {
             ep_student::PreprocessDepthUint16Mm(mm.data(), h, w, this->ep_depth_proc_);
-            this->ep_have_depth_frame_ = true;
-            this->ep_depth_fresh_ = true;
-            this->ep_last_depth_stamp_ns_ = stamp;
-            got_new = true;
-            this->policy_output_allowed.store(true);
-            static int log_n = 0;
-            if (log_n < 8 || log_n % 30 == 0)
-            {
-                std::cout << LOGGER::INFO << "[EP_DEPTH] tcp frame " << w << "x" << h
-                          << " stamp_ns=" << stamp << " (fresh)" << std::endl;
-            }
-            ++log_n;
         }
     }
+    else if (this->ep_offline_depth_)
+    {
+        this->ep_depth_fresh_ = true;
+    }
+    else
+    {
+        uint64_t age = 0;
+        this->ep_depth_fresh_ = this->DepthRecvAgeNs(age) && age < kEpFreshNs;
+    }
 
-    if (!this->ep_have_depth_frame_)
+    if (!this->ep_have_depth_frame_ && !this->ep_offline_depth_)
     {
         return;
     }
 
-    if (!got_new && !this->ep_offline_depth_)
+    uint64_t age = 0;
+    if (!this->ep_offline_depth_ && this->DepthRecvAgeNs(age) && age > kEpStaleNs)
     {
-        if (this->ep_stale_encode_logs_ < 8 || this->ep_stale_encode_logs_ % 50 == 0)
+        const uint64_t now = EpMonoNs();
+        if (this->ep_last_stale_warn_ns_ == 0 || now - this->ep_last_stale_warn_ns_ >= kEpWarnPeriodNs)
         {
+            this->ep_last_stale_warn_ns_ = now;
             std::cout << LOGGER::WARNING << "[EP_DEPTH] encoding with STALE depth cache"
-                      << " last_stamp_ns=" << this->ep_last_depth_stamp_ns_ << std::endl;
+                      << " last_stamp_ns=" << this->ep_last_depth_stamp_ns_
+                      << " recv_age_ms=" << (age / 1000000ull) << std::endl;
         }
-        ++this->ep_stale_encode_logs_;
+    }
+
+    if (!this->ep_offline_depth_ && got && seq == this->ep_last_encoded_seq_)
+    {
+        return;
     }
 
     try
     {
-        std::string weight_name = "vision_weight.pt";
-        try
-        {
-            weight_name = this->params.Get<std::string>("vision_weight_name");
-        }
-        catch (...)
-        {
-        }
-        const std::string path =
-            std::string(POLICY_DIR) + "/" + this->robot_name + "/" + this->config_name + "/" + weight_name;
-        this->ep_encoder_.EnsureLoaded(path);
+        this->EnsureEpEncoderLoaded();
         this->ep_encoder_.Encode(this->ep_depth_proc_, proprio53, this->ep_latent_, this->ep_yaw_);
+        if (got)
+        {
+            this->ep_last_encoded_seq_ = seq;
+        }
     }
     catch (const std::exception &e)
     {
@@ -479,7 +685,7 @@ void RL_Real::RunModel()
 
         this->obs.actions = this->Forward();
         // EP: warm encoder / pull TCP while gated, but do not enqueue policy targets
-        // until a stamp-advancing depth frame has been accepted (or offline bin).
+        // until a recently received depth frame is available (recv_age < 300ms).
         if (this->config_name == "go2_ep_student" && !this->policy_output_allowed.load())
         {
             return;
@@ -539,17 +745,12 @@ std::vector<float> RL_Real::Forward()
         {
             this->ep_hist_.ready = false;
             this->ep_policy_step_ = 0;
-            this->ep_latent_.assign(ep_student::kLatent, 0.0f);
-            this->ep_yaw_.assign(2, 0.0f);
-            this->ep_encoder_.Reset();
             this->ep_stale_encode_logs_ = 0;
-            // Require a fresh TCP stamp (or offline bin) before first policy output.
+            // Keep GetUp-warmed encoder/latent/recv_ns. Do not snapshot stamp and wait
+            // for it to advance — that deadlocks when ROS header.stamp is frozen.
             if (!this->ep_offline_depth_)
             {
                 this->policy_output_allowed.store(false);
-                this->ep_last_depth_stamp_ns_ = 0;
-                this->ep_have_depth_frame_ = false;
-                this->ep_depth_fresh_ = false;
             }
             else
             {
@@ -611,6 +812,11 @@ std::vector<float> RL_Real::Forward()
             proprio[7] = 0.0f;
             this->MaybeUpdateEpDepthFromBridge(proprio);
         }
+        else
+        {
+            uint64_t age = 0;
+            this->ep_depth_fresh_ = this->DepthRecvAgeNs(age) && age < kEpFreshNs;
+        }
         if (this->ep_yaw_.size() >= 2)
         {
             ep_obs[6] = 1.5f * this->ep_yaw_[0];
@@ -620,7 +826,7 @@ std::vector<float> RL_Real::Forward()
         {
             this->ep_latent_.assign(ep_student::kLatent, 0.0f);
         }
-        if (!this->policy_output_allowed.load())
+        if (!this->TryArmEpFirstForward())
         {
             // Hold: no policy forward yet (FSM keeps stand PD).
             actions.assign(12, 0.0f);
