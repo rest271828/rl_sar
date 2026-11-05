@@ -5,9 +5,24 @@
 
 #include "rl_real_go2.hpp"
 
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+
 RL_Real::RL_Real(int argc, char **argv)
 {
     bool wheel_mode = (argc > 2 && std::string(argv[2]) == "wheel");
+
+    {
+        const char *dry = std::getenv("RL_SAR_DRY_RUN");
+        this->dry_run_ = (dry && *dry && std::string(dry) != "0");
+        if (this->dry_run_)
+        {
+            std::cout << LOGGER::WARNING
+                      << "[DRY_RUN] RL_SAR_DRY_RUN=1: no lowcmd publish, no MotionSwitcher ReleaseMode"
+                      << std::endl;
+        }
+    }
 
 #if defined(USE_ROS1) && defined(USE_ROS)
     ros::NodeHandle nh;
@@ -57,20 +72,29 @@ RL_Real::RL_Real(int argc, char **argv)
     this->msc.SetTimeout(10.0f);
     this->msc.Init();
     // Shut down motion control-related service
-    while(this->QueryMotionStatus())
+    if (!this->dry_run_)
     {
-        std::cout << "Try to deactivate the motion control-related service." << std::endl;
-        int32_t ret = this->msc.ReleaseMode();
-        if (ret == 0)
+        while (this->QueryMotionStatus())
         {
-            std::cout << "ReleaseMode succeeded." << std::endl;
+            std::cout << "Try to deactivate the motion control-related service." << std::endl;
+            int32_t ret = this->msc.ReleaseMode();
+            if (ret == 0)
+            {
+                std::cout << "ReleaseMode succeeded." << std::endl;
+            }
+            else
+            {
+                std::cout << "ReleaseMode failed. Error code: " << ret << std::endl;
+            }
+            sleep(1);
         }
-        else
-        {
-            std::cout << "ReleaseMode failed. Error code: " << ret << std::endl;
-        }
-        sleep(1);
     }
+    else
+    {
+        std::cout << LOGGER::WARNING << "[DRY_RUN] skipping MotionSwitcher ReleaseMode loop" << std::endl;
+    }
+
+    this->InitEpDepthBridge();
 
     // loop
     this->loop_keyboard = std::make_shared<LoopFunc>("loop_keyboard", 0.05, std::bind(&RL_Real::KeyboardInterface, this));
@@ -96,6 +120,7 @@ RL_Real::RL_Real(int argc, char **argv)
 
 RL_Real::~RL_Real()
 {
+    this->ep_depth_tcp_.Stop();
     this->loop_keyboard->shutdown();
     this->loop_control->shutdown();
     this->loop_rl->shutdown();
@@ -103,6 +128,152 @@ RL_Real::~RL_Real()
     this->loop_plot->shutdown();
 #endif
     std::cout << LOGGER::INFO << "RL_Real exit" << std::endl;
+}
+
+void RL_Real::InitEpDepthBridge()
+{
+    this->ep_latent_.assign(ep_student::kLatent, 0.0f);
+    this->ep_yaw_.assign(2, 0.0f);
+    this->ep_depth_proc_.assign(ep_student::kOutH * ep_student::kOutW, -0.5f);
+
+    // Optional one-shot depth dump for offline verify: RL_SAR_EP_DEPTH_BIN=/path/to/WxH_uint16.mm
+    // paired with RL_SAR_EP_DEPTH_WH=848x480
+    const char *bin = std::getenv("RL_SAR_EP_DEPTH_BIN");
+    if (bin && *bin)
+    {
+        int w = 848, h = 480;
+        if (const char *wh = std::getenv("RL_SAR_EP_DEPTH_WH"))
+        {
+            int rw = 0, rh = 0;
+            if (std::sscanf(wh, "%dx%d", &rw, &rh) == 2 && rw > 0 && rh > 0)
+            {
+                w = rw;
+                h = rh;
+            }
+        }
+        std::ifstream ifs(bin, std::ios::binary);
+        if (ifs)
+        {
+            std::vector<uint16_t> mm(static_cast<size_t>(w) * static_cast<size_t>(h));
+            ifs.read(reinterpret_cast<char *>(mm.data()), static_cast<std::streamsize>(mm.size() * sizeof(uint16_t)));
+            if (ifs.gcount() == static_cast<std::streamsize>(mm.size() * sizeof(uint16_t)))
+            {
+                ep_student::PreprocessDepthUint16Mm(mm.data(), h, w, this->ep_depth_proc_);
+                this->ep_have_depth_frame_ = true;
+                this->ep_depth_fresh_ = true;
+                std::cout << LOGGER::INFO << "[EP_DEPTH] loaded offline bin " << bin
+                          << " (" << w << "x" << h << ")" << std::endl;
+            }
+            else
+            {
+                std::cout << LOGGER::ERROR << "[EP_DEPTH] short read from " << bin << std::endl;
+            }
+        }
+        else
+        {
+            std::cout << LOGGER::ERROR << "[EP_DEPTH] cannot open RL_SAR_EP_DEPTH_BIN=" << bin << std::endl;
+        }
+    }
+
+    // Jetson TCP bridge (preferred when laptop cannot join Jetson ROS2/CycloneDDS domain)
+    const char *host = std::getenv("RL_SAR_EP_DEPTH_HOST");
+    const char *port_s = std::getenv("RL_SAR_EP_DEPTH_PORT");
+    if (host && *host)
+    {
+        int port = 9876;
+        if (port_s && *port_s)
+        {
+            port = std::atoi(port_s);
+        }
+        this->ep_depth_tcp_.Start(host, port);
+        std::cout << LOGGER::INFO << "[EP_DEPTH] TCP client -> " << host << ":" << port
+                  << " (Jetson should run scripts/jetson_depth_tcp_bridge.py)" << std::endl;
+    }
+    else
+    {
+        std::cout << LOGGER::WARNING
+                  << "[EP_DEPTH] no RL_SAR_EP_DEPTH_HOST; latent stays 0 until TCP/bin provides depth"
+                  << std::endl;
+    }
+}
+
+bool RL_Real::EpTerrainIsFlat() const
+{
+    const char *terr = std::getenv("RL_SAR_EP_TERRAIN");
+    if (terr && *terr)
+    {
+        const std::string t(terr);
+        if (t == "parkour")
+        {
+            return false;
+        }
+        if (t == "flat")
+        {
+            return true;
+        }
+    }
+    // Real robot default: parkour one-hot (obs[11]=1), same as step scenes in sim.
+    return false;
+}
+
+void RL_Real::MaybeUpdateEpDepthFromBridge(const std::vector<float> &proprio53)
+{
+    // Pull newest TCP frame into processed cache.
+    std::vector<uint16_t> mm;
+    int w = 0, h = 0;
+    uint64_t stamp = 0;
+    if (this->ep_depth_tcp_.TryGetLatestMm(mm, w, h, stamp))
+    {
+        ep_student::PreprocessDepthUint16Mm(mm.data(), h, w, this->ep_depth_proc_);
+        this->ep_have_depth_frame_ = true;
+        this->ep_depth_fresh_ = true;
+        static int log_n = 0;
+        if (log_n < 5)
+        {
+            ++log_n;
+            std::cout << LOGGER::INFO << "[EP_DEPTH] tcp frame " << w << "x" << h
+                      << " stamp_ns=" << stamp << std::endl;
+        }
+    }
+
+    if (!this->ep_have_depth_frame_)
+    {
+        return;
+    }
+
+    try
+    {
+        std::string weight_name = "vision_weight.pt";
+        try
+        {
+            weight_name = this->params.Get<std::string>("vision_weight_name");
+        }
+        catch (...)
+        {
+        }
+        const std::string path =
+            std::string(POLICY_DIR) + "/" + this->robot_name + "/" + this->config_name + "/" + weight_name;
+        this->ep_encoder_.EnsureLoaded(path);
+        this->ep_encoder_.Encode(this->ep_depth_proc_, proprio53, this->ep_latent_, this->ep_yaw_);
+        this->ep_depth_fresh_ = false;
+    }
+    catch (const std::exception &e)
+    {
+        static bool warned = false;
+        if (!warned)
+        {
+            warned = true;
+            std::cerr << "[EP_DEPTH] encoder unavailable, latent stays 0: " << e.what() << std::endl;
+        }
+        if ((int)this->ep_latent_.size() != ep_student::kLatent)
+        {
+            this->ep_latent_.assign(ep_student::kLatent, 0.0f);
+        }
+        if ((int)this->ep_yaw_.size() != 2)
+        {
+            this->ep_yaw_.assign(2, 0.0f);
+        }
+    }
 }
 
 void RL_Real::GetState(RobotState<float> *state)
@@ -164,6 +335,11 @@ void RL_Real::GetState(RobotState<float> *state)
 
 void RL_Real::SetCommand(const RobotCommand<float> *command)
 {
+    if (this->dry_run_)
+    {
+        return;
+    }
+
     unitree_go::msg::dds_::LowCmd_ dds_low_command;
     dds_low_command.head()[0] = 0xFE;
     dds_low_command.head()[1] = 0xEF;
@@ -243,9 +419,6 @@ void RL_Real::RunModel()
             output_dof_tau_queue.push(this->output_dof_tau);
         }
 
-        // this->TorqueProtect(this->output_dof_tau);
-        // this->AttitudeProtect(this->robot_state.imu.quaternion, 75.0f, 75.0f);
-
 #ifdef CSV_LOGGER
         std::vector<float> tau_est = this->robot_state.motor_state.tau_est;
         this->CSVLogger(this->output_dof_tau, tau_est, this->obs.dof_pos, this->output_dof_pos, this->obs.dof_vel);
@@ -264,18 +437,114 @@ std::vector<float> RL_Real::Forward()
         return this->obs.actions;
     }
 
-    std::vector<float> clamped_obs = this->ComputeObservation();
-
     std::vector<float> actions;
-    if (!this->params.Get<std::vector<int>>("observations_history").empty())
+
+    // Extreme Parkour Student: (obs[753], depth_latent[32]) -> action[12]
+    if (this->config_name == "go2_ep_student")
     {
-        this->history_obs_buf.insert(clamped_obs);
-        this->history_obs = this->history_obs_buf.get_obs_vec(this->params.Get<std::vector<int>>("observations_history"));
-        actions = this->model->forward({this->history_obs});
+        int update_interval = ep_student::kUpdateInterval;
+        try
+        {
+            update_interval = this->params.Get<int>("ep_update_interval");
+        }
+        catch (...)
+        {
+        }
+        if (update_interval <= 0)
+        {
+            update_interval = ep_student::kUpdateInterval;
+        }
+
+        if (this->episode_length_buf <= 1)
+        {
+            this->ep_hist_.ready = false;
+            this->ep_policy_step_ = 0;
+            this->ep_latent_.assign(ep_student::kLatent, 0.0f);
+            this->ep_yaw_.assign(2, 0.0f);
+            this->ep_encoder_.Reset();
+        }
+
+        ep_student::ProprioInput pin;
+        pin.ang_vel = this->obs.ang_vel;
+        pin.base_quat = this->obs.base_quat;
+        pin.cmd_vx = this->control.x;
+        pin.terrain_flat = this->EpTerrainIsFlat();
+        pin.dof_pos = this->obs.dof_pos;
+        pin.dof_vel = this->obs.dof_vel;
+        pin.last_action = this->ep_last_action_;
+        try
+        {
+            pin.default_pos = this->params.Get<std::vector<float>>("default_dof_pos");
+        }
+        catch (...)
+        {
+        }
+        try
+        {
+            pin.scales.ang_vel = this->params.Get<float>("ang_vel_scale");
+        }
+        catch (...)
+        {
+        }
+        try
+        {
+            pin.scales.dof_pos = this->params.Get<float>("dof_pos_scale");
+        }
+        catch (...)
+        {
+        }
+        try
+        {
+            pin.scales.dof_vel = this->params.Get<float>("dof_vel_scale");
+        }
+        catch (...)
+        {
+        }
+        try
+        {
+            pin.scales.clip_obs = this->params.Get<float>("clip_obs");
+        }
+        catch (...)
+        {
+        }
+
+        std::vector<float> ep_obs = ep_student::BuildObservation(pin, this->ep_hist_);
+        if (this->ep_policy_step_ % update_interval == 0)
+        {
+            std::vector<float> proprio(ep_obs.begin(), ep_obs.begin() + ep_student::kNProprio);
+            proprio[6] = 0.0f;
+            proprio[7] = 0.0f;
+            this->MaybeUpdateEpDepthFromBridge(proprio);
+        }
+        if (this->ep_yaw_.size() >= 2)
+        {
+            ep_obs[6] = 1.5f * this->ep_yaw_[0];
+            ep_obs[7] = 1.5f * this->ep_yaw_[1];
+        }
+        if ((int)this->ep_latent_.size() != ep_student::kLatent)
+        {
+            this->ep_latent_.assign(ep_student::kLatent, 0.0f);
+        }
+        actions = this->model->forward({ep_obs, this->ep_latent_});
+        this->ep_policy_step_ += 1;
+        if ((int)actions.size() >= 12)
+        {
+            this->ep_last_action_.assign(actions.begin(), actions.begin() + 12);
+        }
     }
     else
     {
-        actions = this->model->forward({clamped_obs});
+        std::vector<float> clamped_obs = this->ComputeObservation();
+        if (!this->params.Get<std::vector<int>>("observations_history").empty())
+        {
+            this->history_obs_buf.insert(clamped_obs);
+            this->history_obs = this->history_obs_buf.get_obs_vec(this->params.Get<std::vector<int>>("observations_history"));
+            actions = this->model->forward({this->history_obs});
+        }
+        else
+        {
+            actions = this->model->forward({clamped_obs});
+        }
     }
 
     if (!this->params.Get<std::vector<float>>("clip_actions_upper").empty() && !this->params.Get<std::vector<float>>("clip_actions_lower").empty())
@@ -466,6 +735,21 @@ int main(int argc, char **argv)
 #elif defined(USE_CMAKE) || !defined(USE_ROS)
     signal(SIGINT, signalHandler);
     RL_Real rl_sar(argc, argv);
+    // Offline smoke: RL_SAR_EP_SMOKE_SECONDS=N exits after N seconds without needing Ctrl-C.
+    int smoke_s = 0;
+    if (const char *smoke = std::getenv("RL_SAR_EP_SMOKE_SECONDS"))
+    {
+        smoke_s = std::atoi(smoke);
+    }
+    if (smoke_s > 0)
+    {
+        for (int i = 0; i < smoke_s && !g_shutdown_requested; ++i)
+        {
+            sleep(1);
+        }
+        g_shutdown_requested = 1;
+        std::cout << LOGGER::INFO << "[SMOKE] auto-exit after " << smoke_s << "s" << std::endl;
+    }
     while (!g_shutdown_requested) { sleep(1); }
     std::cout << LOGGER::INFO << "Exiting..." << std::endl;
 #endif

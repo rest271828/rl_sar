@@ -176,8 +176,10 @@ public:
         if (rl.config_name == "go2_ep_student")
         {
             std::cout << LOGGER::WARNING
-                      << "go2_ep_student: MuJoCo Forward uses dual-input JIT with ZERO depth latent "
-                      << "(no depth camera). For vision MXD use sim_isaac_bridge.py." << std::endl;
+                      << "go2_ep_student: dual-input Forward (753+32). Real depth via "
+                      << "RL_SAR_EP_DEPTH_HOST TCP bridge or RL_SAR_EP_DEPTH_BIN. "
+                      << "Do NOT press 1 until depth latent is verified. "
+                      << "MuJoCo without camera still uses zero/ray latent." << std::endl;
         }
         std::string robot_config_path = rl.robot_name + "/" + rl.config_name;
         try

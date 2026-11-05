@@ -16,6 +16,7 @@
 #include "loop.hpp"
 #include "fsm_go2.hpp"
 #include "fsm_go2w.hpp"
+#include "ep_student.hpp"
 
 #include <unitree/robot/channel/channel_publisher.hpp>
 #include <unitree/robot/channel/channel_subscriber.hpp>
@@ -26,6 +27,7 @@
 #include <unitree/common/thread/thread.hpp>
 #include <unitree/robot/b2/motion_switcher/motion_switcher_client.hpp>
 #include <csignal>
+#include <atomic>
 
 #if defined(USE_ROS1) && defined(USE_ROS)
 #include <ros/ros.h>
@@ -89,6 +91,22 @@ private:
     void SetCommand(const RobotCommand<float> *command) override;
     void RunModel();
     void RobotControl();
+
+    // EP Student (go2_ep_student)
+    void InitEpDepthBridge();
+    void MaybeUpdateEpDepthFromBridge(const std::vector<float> &proprio53);
+    bool EpTerrainIsFlat() const;
+    ep_student::DepthEncoder ep_encoder_;
+    ep_student::DepthTcpClient ep_depth_tcp_;
+    ep_student::HistState ep_hist_;
+    std::vector<float> ep_latent_;
+    std::vector<float> ep_yaw_;
+    std::vector<float> ep_last_action_;
+    std::vector<float> ep_depth_proc_; // cached 58x87
+    std::atomic<bool> ep_depth_fresh_{false};
+    int ep_policy_step_ = 0;
+    bool ep_have_depth_frame_ = false;
+    bool dry_run_ = false; // RL_SAR_DRY_RUN=1: no lowcmd / no motion switcher release
 
     // loop
     std::shared_ptr<LoopFunc> loop_keyboard;

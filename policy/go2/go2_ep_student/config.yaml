@@ -5,6 +5,7 @@
 
 go2/go2_ep_student:
   model_name: "base_jit.pt"
+  # C++ loads sibling vision_weight.bin (EPWT); generate via scripts/export_vision_weight_bin.py
   vision_weight_name: "vision_weight.pt"
   # InitRL buffer sizing (himloco-shaped); EP Forward builds 753-d obs separately.
   num_observations: 45
@@ -30,7 +31,6 @@ go2/go2_ep_student:
   dof_vel_scale: 0.05
   commands_scale: [1.0, 1.0, 0.25]
   torque_limits: [23.5, 23.5, 23.5, 23.5, 23.5, 23.5, 23.5, 23.5, 23.5, 23.5, 23.5, 23.5]
-  # Policy/training order FL,FR,RL,RR (matches EP + himloco joint_mapping)
-  default_dof_pos: [0.1, 0.7, -1.5, -0.1, 0.7, -1.5, 0.1, 1.0, -1.5, -0.1, 1.0, -1.5]
-  # MuJoCo sensor order FR,FL,RR,RL → policy FL,FR,RL,RR (same as EP reindex / himloco)
-  joint_mapping: [3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8]
+  # 策略顺序是 FR, FL, RR, RL。不要套用 himloco 的 joint_mapping。
+  default_dof_pos: [-0.1, 0.7, -1.5, 0.1, 0.7, -1.5, -0.1, 1.0, -1.5, 0.1, 1.0, -1.5]
+  joint_mapping: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
