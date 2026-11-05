@@ -165,6 +165,9 @@ void RL_Real::InitEpDepthBridge()
                 ep_student::PreprocessDepthUint16Mm(mm.data(), h, w, this->ep_depth_proc_);
                 this->ep_have_depth_frame_ = true;
                 this->ep_depth_fresh_ = true;
+                this->ep_offline_depth_ = true;
+                this->ep_last_depth_stamp_ns_ = 1; // synthetic non-zero stamp
+                this->policy_output_allowed.store(true);
                 std::cout << LOGGER::INFO << "[EP_DEPTH] loaded offline bin " << bin
                           << " (" << w << "x" << h << ")" << std::endl;
             }
@@ -222,27 +225,57 @@ bool RL_Real::EpTerrainIsFlat() const
 
 void RL_Real::MaybeUpdateEpDepthFromBridge(const std::vector<float> &proprio53)
 {
-    // Pull newest TCP frame into processed cache.
+    // Latch clears at each update attempt so CSV sees fresh=1 for ~update_interval.
+    this->ep_depth_fresh_ = false;
+
+    // Pull newest TCP frame into processed cache; reject non-increasing stamps.
     std::vector<uint16_t> mm;
     int w = 0, h = 0;
     uint64_t stamp = 0;
+    bool got_new = false;
     if (this->ep_depth_tcp_.TryGetLatestMm(mm, w, h, stamp))
     {
-        ep_student::PreprocessDepthUint16Mm(mm.data(), h, w, this->ep_depth_proc_);
-        this->ep_have_depth_frame_ = true;
-        this->ep_depth_fresh_ = true;
-        static int log_n = 0;
-        if (log_n < 5)
+        if (stamp <= this->ep_last_depth_stamp_ns_)
         {
+            static int reject_n = 0;
+            if (reject_n < 5 || reject_n % 60 == 0)
+            {
+                std::cout << LOGGER::WARNING << "[EP_DEPTH] reject non-increasing stamp_ns=" << stamp
+                          << " last=" << this->ep_last_depth_stamp_ns_ << std::endl;
+            }
+            ++reject_n;
+        }
+        else
+        {
+            ep_student::PreprocessDepthUint16Mm(mm.data(), h, w, this->ep_depth_proc_);
+            this->ep_have_depth_frame_ = true;
+            this->ep_depth_fresh_ = true;
+            this->ep_last_depth_stamp_ns_ = stamp;
+            got_new = true;
+            this->policy_output_allowed.store(true);
+            static int log_n = 0;
+            if (log_n < 8 || log_n % 30 == 0)
+            {
+                std::cout << LOGGER::INFO << "[EP_DEPTH] tcp frame " << w << "x" << h
+                          << " stamp_ns=" << stamp << " (fresh)" << std::endl;
+            }
             ++log_n;
-            std::cout << LOGGER::INFO << "[EP_DEPTH] tcp frame " << w << "x" << h
-                      << " stamp_ns=" << stamp << std::endl;
         }
     }
 
     if (!this->ep_have_depth_frame_)
     {
         return;
+    }
+
+    if (!got_new && !this->ep_offline_depth_)
+    {
+        if (this->ep_stale_encode_logs_ < 8 || this->ep_stale_encode_logs_ % 50 == 0)
+        {
+            std::cout << LOGGER::WARNING << "[EP_DEPTH] encoding with STALE depth cache"
+                      << " last_stamp_ns=" << this->ep_last_depth_stamp_ns_ << std::endl;
+        }
+        ++this->ep_stale_encode_logs_;
     }
 
     try
@@ -259,7 +292,6 @@ void RL_Real::MaybeUpdateEpDepthFromBridge(const std::vector<float> &proprio53)
             std::string(POLICY_DIR) + "/" + this->robot_name + "/" + this->config_name + "/" + weight_name;
         this->ep_encoder_.EnsureLoaded(path);
         this->ep_encoder_.Encode(this->ep_depth_proc_, proprio53, this->ep_latent_, this->ep_yaw_);
-        this->ep_depth_fresh_ = false;
     }
     catch (const std::exception &e)
     {
@@ -446,6 +478,12 @@ void RL_Real::RunModel()
         this->obs.dof_vel = this->robot_state.motor_state.dq;
 
         this->obs.actions = this->Forward();
+        // EP: warm encoder / pull TCP while gated, but do not enqueue policy targets
+        // until a stamp-advancing depth frame has been accepted (or offline bin).
+        if (this->config_name == "go2_ep_student" && !this->policy_output_allowed.load())
+        {
+            return;
+        }
         this->ComputeOutput(this->obs.actions, this->output_dof_pos, this->output_dof_vel, this->output_dof_tau);
 
         if (!this->output_dof_pos.empty())
@@ -504,6 +542,19 @@ std::vector<float> RL_Real::Forward()
             this->ep_latent_.assign(ep_student::kLatent, 0.0f);
             this->ep_yaw_.assign(2, 0.0f);
             this->ep_encoder_.Reset();
+            this->ep_stale_encode_logs_ = 0;
+            // Require a fresh TCP stamp (or offline bin) before first policy output.
+            if (!this->ep_offline_depth_)
+            {
+                this->policy_output_allowed.store(false);
+                this->ep_last_depth_stamp_ns_ = 0;
+                this->ep_have_depth_frame_ = false;
+                this->ep_depth_fresh_ = false;
+            }
+            else
+            {
+                this->policy_output_allowed.store(true);
+            }
         }
 
         ep_student::ProprioInput pin;
@@ -551,7 +602,9 @@ std::vector<float> RL_Real::Forward()
         }
 
         std::vector<float> ep_obs = ep_student::BuildObservation(pin, this->ep_hist_);
-        if (this->ep_policy_step_ % update_interval == 0)
+        // Pull depth every step until armed so GetUp→RL does not wait on update_interval.
+        const bool need_depth_gate = !this->policy_output_allowed.load();
+        if (need_depth_gate || (this->ep_policy_step_ % update_interval == 0))
         {
             std::vector<float> proprio(ep_obs.begin(), ep_obs.begin() + ep_student::kNProprio);
             proprio[6] = 0.0f;
@@ -566,6 +619,13 @@ std::vector<float> RL_Real::Forward()
         if ((int)this->ep_latent_.size() != ep_student::kLatent)
         {
             this->ep_latent_.assign(ep_student::kLatent, 0.0f);
+        }
+        if (!this->policy_output_allowed.load())
+        {
+            // Hold: no policy forward yet (FSM keeps stand PD).
+            actions.assign(12, 0.0f);
+            this->ep_policy_step_ += 1;
+            return actions;
         }
         actions = this->model->forward({ep_obs, this->ep_latent_});
         this->ep_policy_step_ += 1;

@@ -202,6 +202,10 @@ public:
     RobotState<float> start_state;
     RobotState<float> now_state;
     bool rl_init_done = false;
+    // When false, FSM should hold stand PD and RunModel must not enqueue policy
+    // targets. EP sets this false until a fresh (stamp-advancing) depth frame
+    // has been accepted; other configs leave it true.
+    std::atomic<bool> policy_output_allowed{true};
 
     // init
     void InitObservations();

@@ -574,6 +574,8 @@ struct DepthTcpClient::Impl
     uint64_t stamp_ns = 0;
     uint64_t seq = 0;
     uint64_t last_got_seq = 0;
+    uint64_t last_accepted_stamp_ns = 0;
+    uint64_t rejected_nonincreasing = 0;
 };
 
 DepthTcpClient::DepthTcpClient() : impl_(new Impl) {}
@@ -646,10 +648,25 @@ void DepthTcpClient::Start(const std::string &host, int port)
                 }
                 {
                     std::lock_guard<std::mutex> lock(impl_->mu);
+                    // Reject keepalive / replay frames whose ROS stamp did not advance.
+                    if (stamp <= impl_->last_accepted_stamp_ns)
+                    {
+                        impl_->rejected_nonincreasing += 1;
+                        if (impl_->rejected_nonincreasing <= 5 ||
+                            impl_->rejected_nonincreasing % 60 == 0)
+                        {
+                            std::cerr << "[EP_DEPTH_TCP] reject non-increasing stamp_ns=" << stamp
+                                      << " last_accepted=" << impl_->last_accepted_stamp_ns
+                                      << " (count=" << impl_->rejected_nonincreasing << ")"
+                                      << std::endl;
+                        }
+                        continue;
+                    }
                     impl_->latest.swap(frame);
                     impl_->w = static_cast<int>(w);
                     impl_->h = static_cast<int>(h);
                     impl_->stamp_ns = stamp;
+                    impl_->last_accepted_stamp_ns = stamp;
                     impl_->seq += 1;
                 }
             }

@@ -258,6 +258,9 @@ private:
     std::atomic<bool> ep_depth_fresh_{false};
     int ep_policy_step_ = 0;
     bool ep_have_depth_frame_ = false;
+    uint64_t ep_last_depth_stamp_ns_ = 0;
+    bool ep_offline_depth_ = false; // RL_SAR_EP_DEPTH_BIN loaded
+    int ep_stale_encode_logs_ = 0;
     bool dry_run_ = false; // RL_SAR_DRY_RUN=1: no lowcmd / no motion switcher release
     Go2RuntimeLogger runtime_log_;
 

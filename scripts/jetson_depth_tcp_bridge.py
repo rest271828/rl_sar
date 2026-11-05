@@ -71,43 +71,58 @@ def pack_frame(payload: bytes, w: int, h: int, stamp_ns: int) -> bytes:
 
 
 def serve(bind: str, port: int, latest: LatestFrame, min_period_s: float) -> None:
+    """Send a depth frame only when ROS stamp advances (no same-stamp keepalive).
+
+    If the camera stalls, we intentionally send nothing rather than replaying an
+    old stamp — the laptop must treat missing updates as stale. TCP keepalive
+    keeps the socket alive; a log heartbeat reports idle time.
+    """
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((bind, port))
     srv.listen(4)
-    print(f"[bridge] listening on {bind}:{port}", flush=True)
+    print(f"[bridge] listening on {bind}:{port} (send only on advancing stamp)", flush=True)
     while True:
         conn, addr = srv.accept()
         print(f"[bridge] client {addr}", flush=True)
-        last_seq = -1
+        last_sent_stamp = -1
         last_send = 0.0
+        last_hb = time.time()
         frames_sent = 0
+        skipped_same = 0
         try:
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            # Detect dead peers without replaying depth frames.
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             with conn:
                 while True:
                     item = latest.get()
+                    now = time.time()
+                    if now - last_hb >= 2.0:
+                        print(
+                            f"[bridge] heartbeat sent={frames_sent} skip_same_stamp={skipped_same} "
+                            f"last_stamp={last_sent_stamp} idle_s={now - last_send:.2f}",
+                            flush=True,
+                        )
+                        last_hb = now
                     if item is None:
                         time.sleep(0.01)
                         continue
                     payload, w, h, stamp_ns, seq = item
-                    now = time.time()
-                    # Prefer new frames; also resend latest every 0.2s so clients
-                    # do not block forever if ROS stalls briefly.
-                    if seq == last_seq and (now - last_send) < max(0.2, min_period_s):
+                    if stamp_ns <= last_sent_stamp:
+                        skipped_same += 1
                         time.sleep(0.005)
                         continue
-                    if min_period_s > 0 and (now - last_send) < min_period_s and seq != last_seq:
-                        # rate-limit new frames
+                    if min_period_s > 0 and (now - last_send) < min_period_s:
                         time.sleep(0.001)
                         continue
-                    last_seq = seq
+                    last_sent_stamp = stamp_ns
                     last_send = now
                     conn.sendall(pack_frame(payload, w, h, stamp_ns))
                     frames_sent += 1
                     if frames_sent <= 3 or frames_sent % 30 == 0:
                         print(
-                            f"[bridge] sent frame#{frames_sent} {w}x{h} seq={seq}",
+                            f"[bridge] sent frame#{frames_sent} {w}x{h} seq={seq} stamp_ns={stamp_ns}",
                             flush=True,
                         )
         except (BrokenPipeError, ConnectionResetError, OSError) as e:
