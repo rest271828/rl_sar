@@ -16,6 +16,7 @@
 #include <memory>
 #include <fstream>
 #include <mutex>
+#include <atomic>
 
 #include <yaml-cpp/yaml.h>
 #include "fsm.hpp"
@@ -202,6 +203,15 @@ public:
     RobotState<float> start_state;
     RobotState<float> now_state;
     bool rl_init_done = false;
+    // When false, FSM should hold stand PD and RunModel must not enqueue policy
+    // targets. EP sets this false until a recently-received depth frame
+    // (recv_age < 300ms) is available; other configs leave it true.
+    std::atomic<bool> policy_output_allowed{true};
+
+    // EP depth warmup / first-Forward gate. No-ops except on RL_Real.
+    virtual void PollEpDepthWarmup() {}
+    virtual bool TryArmEpFirstForward() { return true; }
+    virtual void OnEpLocomotionEnter() {}
 
     // init
     void InitObservations();
@@ -220,6 +230,9 @@ public:
 
     // yaml params
     void ReadYaml(const std::string& file_path, const std::string& file_name);
+    // Snapshot stand targets/gains from base.yaml so GetUp/GetDown keep working
+    // after InitRL merges a policy config (e.g. go2_ep_student) into params.
+    void CacheStandParamsFromBase();
 
     // csv logger
     std::string csv_filename;
@@ -233,6 +246,11 @@ public:
     // history buffer
     ObservationBuffer history_obs_buf;
     std::vector<float> history_obs;
+
+    // Stand / GetUp / GetDown (always from base.yaml; not overwritten by policy InitRL)
+    std::vector<float> stand_default_dof_pos;
+    std::vector<float> stand_fixed_kp;
+    std::vector<float> stand_fixed_kd;
 
     // others
     int motiontime = 0;

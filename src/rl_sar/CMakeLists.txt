@@ -232,9 +232,25 @@ if(Python3_LIBRARIES)
 endif()
 
 if(SYSTEM_TYPE STREQUAL "Linux")
-    set(YAML_CPP_LIBRARIES yaml-cpp)
-link_directories(/usr/local/lib)
-include_directories(${YAML_CPP_INCLUDE_DIR})
+    find_package(yaml-cpp QUIET)
+    if(yaml-cpp_FOUND)
+        message(STATUS "Found yaml-cpp via CMake package")
+        set(YAML_CPP_LIBRARIES yaml-cpp)
+        if(DEFINED yaml-cpp_INCLUDE_DIRS)
+            include_directories(${yaml-cpp_INCLUDE_DIRS})
+        endif()
+    else()
+        set(YAML_CPP_LIBRARIES yaml-cpp)
+        link_directories(/usr/local/lib)
+        include_directories(${YAML_CPP_INCLUDE_DIR})
+    endif()
+    # Allow user-prefix / conda eigen + yaml headers
+    if(DEFINED ENV{CONDA_PREFIX})
+        include_directories($ENV{CONDA_PREFIX}/include $ENV{CONDA_PREFIX}/include/eigen3)
+        link_directories($ENV{CONDA_PREFIX}/lib)
+    endif()
+    include_directories($ENV{HOME}/.local/include $ENV{HOME}/.local/include/eigen3)
+    link_directories($ENV{HOME}/.local/lib)
 elseif(SYSTEM_TYPE STREQUAL "Darwin")
     find_library(YAML_CPP_LIB yaml-cpp REQUIRED)
     set(YAML_CPP_LIBRARIES ${YAML_CPP_LIB})
@@ -359,7 +375,22 @@ include_directories(
     library/core/motion_loader
     library/core/inference_runtime
     library/core/logger
+    library/core/ep_student
     fsm_robot
+)
+
+# Shared Extreme Parkour Student helpers (depth encoder + TCP bridge client)
+add_library(ep_student library/core/ep_student/ep_student.cpp)
+if(USE_TORCH)
+    target_link_libraries(ep_student PUBLIC ${TORCH_LIBRARIES})
+    target_compile_definitions(ep_student PUBLIC USE_TORCH)
+endif()
+find_package(Threads REQUIRED)
+target_link_libraries(ep_student PUBLIC Threads::Threads)
+target_include_directories(ep_student PUBLIC
+    library/core/ep_student
+    library/core/vector_math
+    library/core/logger
 )
 
 # library for inference runtime
@@ -499,11 +530,21 @@ if(SYSTEM_TYPE STREQUAL "Linux")
         unitree_sdk2
         rl_sdk
         observation_buffer
+        ep_student
             ${YAML_CPP_LIBRARIES}
     )
     # Add unitree_sdk2 library path to RPATH
     set_target_properties(rl_real_go2 PROPERTIES
         INSTALL_RPATH "${CMAKE_INSTALL_RPATH};${CMAKE_CURRENT_SOURCE_DIR}/library/thirdparty/robot_sdk/unitree/unitree_sdk2/thirdparty/lib/${ARCH_DIR}"
+    )
+    # Offline EP depth + dual-input smoke (no robot I/O)
+    add_executable(ep_depth_smoke src/ep_depth_smoke.cpp)
+    target_link_libraries(ep_depth_smoke
+        ep_student
+        inference_runtime
+    )
+    set_target_properties(ep_depth_smoke PROPERTIES
+        INSTALL_RPATH "${CMAKE_INSTALL_RPATH}"
     )
     if(NOT USE_CMAKE)
         if($ENV{ROS_DISTRO} MATCHES "noetic")

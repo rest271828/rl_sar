@@ -8,6 +8,7 @@
 
 #include "fsm.hpp"
 #include "rl_sdk.hpp"
+#include <cstdlib>
 
 namespace go2_fsm
 {
@@ -38,7 +39,10 @@ public:
 
     std::string CheckChange() override
     {
-        if (rl.control.current_keyboard == Input::Keyboard::Num0 || rl.control.current_gamepad == Input::Gamepad::A)
+        const char* auto_rl = std::getenv("RL_SAR_AUTO_RL");
+        if ((auto_rl && *auto_rl && std::string(auto_rl) != "0") ||
+            rl.control.current_keyboard == Input::Keyboard::Num0 ||
+            rl.control.current_gamepad == Input::Gamepad::A)
         {
             return "RLFSMStateGetUp";
         }
@@ -80,15 +84,21 @@ public:
 
     void Run() override
     {
+        // Nonblocking peek so latent/have_depth is warm before press 1. No EnsureLoaded here.
+        rl.PollEpDepthWarmup();
+        // Always stand to base.yaml targets (not EP/himloco default_dof_pos after InitRL).
+        const auto &stand_pos = !rl.stand_default_dof_pos.empty()
+                                    ? rl.stand_default_dof_pos
+                                    : rl.params.Get<std::vector<float>>("default_dof_pos");
         if(stand_from_passive)
         {
 
             if (Interpolate(percent_pre_getup, rl.now_state.motor_state.q, pre_running_pos, 1.0f, "Pre Getting up", true)) return;
-            if (Interpolate(percent_getup, pre_running_pos, rl.params.Get<std::vector<float>>("default_dof_pos"), 2.0f, "Getting up", true)) return;
+            if (Interpolate(percent_getup, pre_running_pos, stand_pos, 2.0f, "Getting up", true)) return;
         }
         else
         {
-            if (Interpolate(percent_getup, rl.now_state.motor_state.q, rl.params.Get<std::vector<float>>("default_dof_pos"), 1.0f, "Getting up", true)) return;
+            if (Interpolate(percent_getup, rl.now_state.motor_state.q, stand_pos, 1.0f, "Getting up", true)) return;
         }
     }
 
@@ -102,7 +112,10 @@ public:
         }
         if (percent_getup >= 1.0f)
         {
-            if (rl.control.current_keyboard == Input::Keyboard::Num1 || rl.control.current_gamepad == Input::Gamepad::RB_DPadUp)
+            const char* auto_rl = std::getenv("RL_SAR_AUTO_RL");
+            if ((auto_rl && *auto_rl && std::string(auto_rl) != "0") ||
+                rl.control.current_keyboard == Input::Keyboard::Num1 ||
+                rl.control.current_gamepad == Input::Gamepad::RB_DPadUp)
             {
                 return "RLFSMStateRLLocomotion";
             }
@@ -161,8 +174,24 @@ public:
         percent_transition = 0.0f;
         rl.episode_length_buf = 0;
 
-        // read params from yaml
-        rl.config_name = "himloco";
+        // Policy slot: RL_SAR_GO2_CONFIG=himloco|robot_lab|go2_ep_student (default himloco)
+        {
+            const char* env_cfg = std::getenv("RL_SAR_GO2_CONFIG");
+            rl.config_name = (env_cfg && *env_cfg) ? std::string(env_cfg) : "himloco";
+        }
+        if (rl.config_name == "go2_ep_student")
+        {
+            rl.OnEpLocomotionEnter();
+            std::cout << LOGGER::WARNING
+                      << "go2_ep_student: dual-input Forward (753+32). Holding stand PD until "
+                      << "a depth frame with recv_age < 300ms. Verify stamp_ns increments / "
+                      << "ep_depth_fresh before trusting RL. "
+                      << "Depth: RL_SAR_EP_DEPTH_HOST or RL_SAR_EP_DEPTH_BIN." << std::endl;
+        }
+        else
+        {
+            rl.policy_output_allowed.store(true);
+        }
         std::string robot_config_path = rl.robot_name + "/" + rl.config_name;
         try
         {
@@ -179,10 +208,46 @@ public:
 
     void Run() override
     {
-        // position transition from last default_dof_pos to current default_dof_pos
-        // if (Interpolate(percent_transition, rl.now_state.motor_state.q, rl.params.Get<std::vector<float>>("default_dof_pos"), 0.5f, "Policy transition", true)) return;
-
         if (!rl.rl_init_done) rl.rl_init_done = true;
+
+        // EP: keep base.yaml stand PD until a recently received depth frame arms the
+        // policy, then a short position blend to EP default_dof_pos still using stand
+        // gains (does not change rl_kp/rl_kd used once RLControl starts).
+        if (rl.config_name == "go2_ep_student" && !rl.TryArmEpFirstForward())
+        {
+            const auto &stand_pos = !rl.stand_default_dof_pos.empty()
+                                        ? rl.stand_default_dof_pos
+                                        : rl.params.Get<std::vector<float>>("default_dof_pos");
+            const auto &kp = !rl.stand_fixed_kp.empty()
+                                 ? rl.stand_fixed_kp
+                                 : rl.params.Get<std::vector<float>>("fixed_kp");
+            const auto &kd = !rl.stand_fixed_kd.empty()
+                                 ? rl.stand_fixed_kd
+                                 : rl.params.Get<std::vector<float>>("fixed_kd");
+            for (int i = 0; i < rl.params.Get<int>("num_of_dofs"); ++i)
+            {
+                fsm_command->motor_command.q[i] = stand_pos[i];
+                fsm_command->motor_command.dq[i] = 0;
+                fsm_command->motor_command.kp[i] = kp[i];
+                fsm_command->motor_command.kd[i] = kd[i];
+                fsm_command->motor_command.tau[i] = 0;
+            }
+            return;
+        }
+
+        if (rl.config_name == "go2_ep_student")
+        {
+            if (percent_transition == 0.0f)
+            {
+                rl.now_state = *fsm_state; // freeze blend start after depth gate opens
+            }
+            if (Interpolate(percent_transition, rl.now_state.motor_state.q,
+                            rl.params.Get<std::vector<float>>("default_dof_pos"), 0.3f,
+                            "EP stand→RL blend", true))
+            {
+                return;
+            }
+        }
 
         std::cout << "\r\033[K" << std::flush << LOGGER::INFO << "RL Controller [" << rl.config_name << "] x:" << rl.control.x << " y:" << rl.control.y << " yaw:" << rl.control.yaw << std::flush;
         RLControl();
