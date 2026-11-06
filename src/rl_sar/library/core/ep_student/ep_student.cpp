@@ -166,6 +166,19 @@ namespace
 {
 std::string SiblingBinPath(const std::string &path)
 {
+    // Guard empty / directory-only inputs that would become ".../.bin".
+    if (path.empty() || path.back() == '/')
+    {
+        const std::string dir = path.empty() ? std::string(".") : path;
+        return dir + (dir.back() == '/' ? "" : "/") + "vision_weight.bin";
+    }
+    const auto slash = path.find_last_of('/');
+    const std::string base = (slash == std::string::npos) ? path : path.substr(slash + 1);
+    if (base.empty() || base == "." || base == ".bin" || base == ".pt")
+    {
+        const std::string dir = (slash == std::string::npos) ? std::string(".") : path.substr(0, slash + 1);
+        return dir + "vision_weight.bin";
+    }
     const std::string suf = ".pt";
     if (path.size() > suf.size() && path.compare(path.size() - suf.size(), suf.size(), suf) == 0)
     {

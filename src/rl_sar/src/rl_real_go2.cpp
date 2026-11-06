@@ -256,31 +256,59 @@ std::string RL_Real::EpVisionWeightPath() const
         cfg = "go2_ep_student";
     }
     // EPWT .bin only — LibTorch cannot reliably unpickle torch.save(.pt) dicts.
+    // IMPORTANT: YamlParams::Get defaults missing keys to T() (empty string), and
+    // encoder preload runs before InitRL merges go2_ep_student/config.yaml. An empty
+    // name becomes POLICY/.../go2_ep_student/ + SiblingBinPath → ".../.bin".
     std::string weight_name = "vision_weight.bin";
-    try
+    if (this->params.Has("vision_weight_name"))
     {
-        weight_name = this->params.Get<std::string>("vision_weight_name");
+        const std::string from_yaml =
+            this->params.Get<std::string>("vision_weight_name", weight_name);
+        if (!from_yaml.empty())
+        {
+            weight_name = from_yaml;
+        }
     }
-    catch (...)
+    // Basename only — reject accidental empty / "." / ".bin" stems from bad joins.
+    const auto slash = weight_name.find_last_of('/');
+    if (slash != std::string::npos)
     {
+        weight_name = weight_name.substr(slash + 1);
+    }
+    if (weight_name.empty() || weight_name == "." || weight_name == ".bin" ||
+        weight_name == ".pt")
+    {
+        weight_name = "vision_weight.bin";
     }
     return std::string(POLICY_DIR) + "/" + this->robot_name + "/" + cfg + "/" + weight_name;
 }
 
 void RL_Real::EnsureEpEncoderLoaded()
 {
-    std::call_once(this->ep_encoder_once_, [this]() {
-        const std::string path = this->EpVisionWeightPath();
-        try
-        {
-            this->ep_encoder_.EnsureLoaded(path);
-        }
-        catch (const std::exception &e)
-        {
-            std::cerr << "[EP_DEPTH] encoder preload failed (" << path << "): " << e.what()
-                      << std::endl;
-        }
-    });
+    if (this->ep_encoder_.ok)
+    {
+        return;
+    }
+    // Mutex (not call_once): early preload can fail when yaml name is still missing;
+    // allow a later retry after InitRL merges config.yaml.
+    static std::mutex load_mu;
+    std::lock_guard<std::mutex> lock(load_mu);
+    if (this->ep_encoder_.ok)
+    {
+        return;
+    }
+    const std::string path = this->EpVisionWeightPath();
+    try
+    {
+        this->ep_encoder_.EnsureLoaded(path);
+        std::cout << LOGGER::INFO << "[EP_DEPTH] loaded vision encoder from " << path
+                  << std::endl;
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "[EP_DEPTH] encoder preload failed (" << path << "): " << e.what()
+                  << std::endl;
+    }
 }
 
 void RL_Real::NoteDepthFrame(uint64_t stamp_ns, uint64_t recv_ns, uint64_t seq)

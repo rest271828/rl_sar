@@ -278,7 +278,6 @@ private:
     uint64_t ep_last_stale_warn_ns_ = 0;
     bool ep_offline_depth_ = false; // RL_SAR_EP_DEPTH_BIN loaded
     int ep_stale_encode_logs_ = 0;
-    std::once_flag ep_encoder_once_;
     std::thread ep_encoder_preload_thr_;
     bool dry_run_ = false; // RL_SAR_DRY_RUN=1: no lowcmd / no motion switcher release
     Go2RuntimeLogger runtime_log_;
