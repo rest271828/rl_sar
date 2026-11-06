@@ -143,14 +143,17 @@ class DepthBridge(Node):
         self.cb_count = 0
         self.last_cb_mono = 0.0
         self.latest = None  # dict
+        # Publisher is RELIABLE (realsense2_camera default). BEST_EFFORT
+        # is DDS-compatible on paper but after reboot this node delivered
+        # one late-join sample then went silent; RELIABLE keeps the stream.
         qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
+            reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
             depth=5,
         )
         self.create_subscription(Image, topic, self._on_depth, qos)
         eprint(
-            "[bridge] subscribe %s BEST_EFFORT keep_last=5; "
+            "[bridge] subscribe %s RELIABLE keep_last=5; "
             "send on stamp advance OR (dt>=30ms AND new callback); "
             "rewrite frozen ROS stamp to strictly increasing stamp_ns"
             % topic
