@@ -101,6 +101,7 @@ RL_Real::RL_Real(int argc, char **argv)
 
     this->InitEpDepthBridge();
     this->runtime_log_.StartIfEnabled();
+    this->depth_dump_.StartIfEnabled(this->runtime_log_.dir());
 
     // loop
     this->loop_keyboard = std::make_shared<LoopFunc>("loop_keyboard", 0.05, std::bind(&RL_Real::KeyboardInterface, this));
@@ -137,6 +138,7 @@ RL_Real::~RL_Real()
 #ifdef PLOT
     this->loop_plot->shutdown();
 #endif
+    this->depth_dump_.Stop();
     this->runtime_log_.Stop();
     std::cout << LOGGER::INFO << "RL_Real exit" << std::endl;
 }
@@ -388,6 +390,7 @@ void RL_Real::PollEpDepthWarmup()
     {
         return;
     }
+    this->depth_dump_.TryMaybePush(mm, w, h, stamp, recv_ns, seq);
     ep_student::PreprocessDepthUint16Mm(mm.data(), h, w, this->ep_depth_proc_);
     std::vector<float> proprio(ep_student::kNProprio, 0.0f);
     this->MaybeEncodeIfLoaded(proprio);
@@ -483,6 +486,7 @@ void RL_Real::MaybeUpdateEpDepthFromBridge(const std::vector<float> &proprio53)
     if (got)
     {
         this->NoteDepthFrame(stamp, recv_ns, seq);
+        this->depth_dump_.TryMaybePush(mm, w, h, stamp, recv_ns, seq);
         if (seq != this->ep_last_encoded_seq_)
         {
             ep_student::PreprocessDepthUint16Mm(mm.data(), h, w, this->ep_depth_proc_);

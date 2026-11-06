@@ -43,6 +43,8 @@ namespace plt = matplotlibcpp;
 #include <chrono>
 #include <thread>
 #include <mutex>
+#include <memory>
+#include <vector>
 #include <cstring>
 #include <ctime>
 #include <cstdio>
@@ -99,6 +101,8 @@ public:
             meta << "stamp=" << stamp << "\n";
             meta << "RL_SAR_GO2_CONFIG=" << (std::getenv("RL_SAR_GO2_CONFIG") ? std::getenv("RL_SAR_GO2_CONFIG") : "") << "\n";
             meta << "RL_SAR_EP_DEPTH_HOST=" << (std::getenv("RL_SAR_EP_DEPTH_HOST") ? std::getenv("RL_SAR_EP_DEPTH_HOST") : "") << "\n";
+            meta << "RL_SAR_EP_TERRAIN=" << (std::getenv("RL_SAR_EP_TERRAIN") ? std::getenv("RL_SAR_EP_TERRAIN") : "") << "\n";
+            meta << "RL_SAR_EP_DEPTH_DUMP=" << (std::getenv("RL_SAR_EP_DEPTH_DUMP") ? std::getenv("RL_SAR_EP_DEPTH_DUMP") : "") << "\n";
             meta << "note=nonblocking control.csv writer; drops when queue > 4000\n";
         }
         csv_.open(dir_ + "/control.csv", std::ios::out | std::ios::trunc);
@@ -196,6 +200,177 @@ private:
     std::ofstream csv_;
     std::string dir_;
 };
+
+// Non-blocking depth dump (RL_SAR_EP_DEPTH_DUMP=1 + RL_SAR_LOG=1).
+// Control/RL path only enqueues; uint16 .mm + sidecar .json written off-thread.
+struct Go2DepthDumpSample
+{
+    int w = 0;
+    int h = 0;
+    uint64_t stamp_ns = 0;
+    uint64_t recv_ns = 0;
+    uint64_t seq = 0;
+    std::shared_ptr<std::vector<uint16_t>> mm;
+};
+
+class Go2DepthDumper
+{
+public:
+    // Requires an existing session log dir (from Go2RuntimeLogger). No-op if dump env off
+    // or session_dir empty. Does not change PD/policy rates.
+    void StartIfEnabled(const std::string &session_dir)
+    {
+        const char *en = std::getenv("RL_SAR_EP_DEPTH_DUMP");
+        if (!(en && *en && std::string(en) != "0"))
+        {
+            return;
+        }
+        if (session_dir.empty())
+        {
+            std::cout << LOGGER::WARNING
+                      << "[EP_DEPTH_DUMP] RL_SAR_EP_DEPTH_DUMP=1 but RL_SAR_LOG is off; dump disabled"
+                      << std::endl;
+            return;
+        }
+        enabled_ = true;
+        dir_ = session_dir + "/depth";
+        ::mkdir(dir_.c_str(), 0755);
+        {
+            std::ofstream meta(session_dir + "/meta.txt", std::ios::app);
+            meta << "depth_dump=uint16_mm+json every_" << stride_ << "th_and_max_2Hz nonblocking\n";
+        }
+        run_ = true;
+        thr_ = std::thread([this]() { this->WriterLoop(); });
+        std::cout << LOGGER::INFO << "[EP_DEPTH_DUMP] writing " << dir_
+                  << " (stride=" << stride_ << ", max~2Hz, queue drop>" << max_queued_ << ")"
+                  << std::endl;
+    }
+
+    void Stop()
+    {
+        if (!enabled_)
+        {
+            return;
+        }
+        run_ = false;
+        if (thr_.joinable())
+        {
+            thr_.join();
+        }
+        std::cout << LOGGER::INFO << "[EP_DEPTH_DUMP] stopped; written=" << written_.load()
+                  << " dropped=" << dropped_.load() << " dir=" << dir_ << std::endl;
+        enabled_ = false;
+    }
+
+    // RL/control-thread safe: subsample + enqueue; never blocks on disk.
+    void TryMaybePush(const std::vector<uint16_t> &mm, int w, int h,
+                      uint64_t stamp_ns, uint64_t recv_ns, uint64_t seq)
+    {
+        if (!enabled_ || w <= 0 || h <= 0 || mm.size() < static_cast<size_t>(w) * static_cast<size_t>(h))
+        {
+            return;
+        }
+        if (seq == last_seen_seq_)
+        {
+            return;
+        }
+        last_seen_seq_ = seq;
+        ++seen_frames_;
+        if ((seen_frames_ % static_cast<uint64_t>(stride_)) != 0)
+        {
+            return;
+        }
+        const uint64_t now = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        if (last_dump_mono_ns_ != 0 && now - last_dump_mono_ns_ < min_interval_ns_)
+        {
+            return;
+        }
+        if (queued_.load(std::memory_order_relaxed) > max_queued_)
+        {
+            dropped_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        Go2DepthDumpSample s;
+        s.w = w;
+        s.h = h;
+        s.stamp_ns = stamp_ns;
+        s.recv_ns = recv_ns;
+        s.seq = seq;
+        s.mm = std::make_shared<std::vector<uint16_t>>(
+            mm.begin(), mm.begin() + static_cast<std::ptrdiff_t>(w) * h);
+        last_dump_mono_ns_ = now;
+        queued_.fetch_add(1, std::memory_order_relaxed);
+        queue_.push(std::move(s));
+    }
+
+    bool enabled() const { return enabled_; }
+
+private:
+    void WriterLoop()
+    {
+        Go2DepthDumpSample s;
+        while (run_.load() || !queue_.empty())
+        {
+            if (queue_.try_pop(s))
+            {
+                queued_.fetch_sub(1, std::memory_order_relaxed);
+                if (!s.mm || s.mm->empty() || s.w <= 0 || s.h <= 0)
+                {
+                    continue;
+                }
+                char stem[96];
+                std::snprintf(stem, sizeof(stem), "%s/seq%08llu_%llu", dir_.c_str(),
+                              static_cast<unsigned long long>(s.seq),
+                              static_cast<unsigned long long>(s.stamp_ns));
+                const std::string mm_path = std::string(stem) + ".mm";
+                const std::string js_path = std::string(stem) + ".json";
+                {
+                    std::ofstream out(mm_path, std::ios::binary | std::ios::trunc);
+                    if (out)
+                    {
+                        out.write(reinterpret_cast<const char *>(s.mm->data()),
+                                  static_cast<std::streamsize>(s.mm->size() * sizeof(uint16_t)));
+                    }
+                }
+                {
+                    std::ofstream js(js_path, std::ios::out | std::ios::trunc);
+                    if (js)
+                    {
+                        js << "{\"w\":" << s.w << ",\"h\":" << s.h
+                           << ",\"stamp_ns\":" << s.stamp_ns
+                           << ",\"recv_ns\":" << s.recv_ns
+                           << ",\"seq\":" << s.seq
+                           << ",\"dtype\":\"uint16\",\"unit\":\"mm\"}\n";
+                    }
+                }
+                written_.fetch_add(1, std::memory_order_relaxed);
+            }
+            else
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        }
+    }
+
+    bool enabled_ = false;
+    std::atomic<bool> run_{false};
+    std::atomic<int> queued_{0};
+    std::atomic<uint64_t> dropped_{0};
+    std::atomic<uint64_t> written_{0};
+    tbb::concurrent_queue<Go2DepthDumpSample> queue_;
+    std::thread thr_;
+    std::string dir_;
+    int stride_ = 5;
+    int max_queued_ = 8;
+    uint64_t min_interval_ns_ = 500000000ull; // ~2 Hz
+    uint64_t last_seen_seq_ = 0;
+    uint64_t seen_frames_ = 0;
+    uint64_t last_dump_mono_ns_ = 0;
+};
+
 #define TOPIC_LOWCMD "rt/lowcmd"
 #define TOPIC_LOWSTATE "rt/lowstate"
 #define TOPIC_JOYSTICK "rt/wirelesscontroller"
@@ -281,6 +456,7 @@ private:
     std::thread ep_encoder_preload_thr_;
     bool dry_run_ = false; // RL_SAR_DRY_RUN=1: no lowcmd / no motion switcher release
     Go2RuntimeLogger runtime_log_;
+    Go2DepthDumper depth_dump_;
 
     // loop
     std::shared_ptr<LoopFunc> loop_keyboard;
