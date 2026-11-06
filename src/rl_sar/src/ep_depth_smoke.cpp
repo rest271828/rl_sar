@@ -24,7 +24,7 @@ int main(int argc, char **argv)
     (void)argv;
 
     const std::string policy_dir = std::string(POLICY_DIR) + "/go2/go2_ep_student";
-    const std::string vision_path = policy_dir + "/vision_weight.pt";
+    const std::string vision_path = policy_dir + "/vision_weight.bin";
     const std::string jit_path = policy_dir + "/base_jit.pt";
 
     std::vector<float> depth_proc;

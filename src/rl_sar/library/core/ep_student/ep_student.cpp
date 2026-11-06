@@ -20,8 +20,6 @@
 
 #ifdef USE_TORCH
 #include <torch/torch.h>
-#include <torch/csrc/jit/serialization/import_read.h>
-#include <caffe2/serialize/inline_container.h>
 #endif
 
 namespace ep_student
@@ -126,30 +124,6 @@ bool RecvAll(int fd, void *buf, size_t n)
 }
 
 #ifdef USE_TORCH
-void CollectTensors(const c10::IValue &value, std::unordered_map<std::string, torch::Tensor> &out)
-{
-    if (!value.isGenericDict())
-    {
-        return;
-    }
-    for (const auto &item : value.toGenericDict())
-    {
-        if (!item.key().isString())
-        {
-            continue;
-        }
-        const std::string key = item.key().toStringRef();
-        if (item.value().isTensor())
-        {
-            out[key] = item.value().toTensor().to(torch::kFloat32).contiguous();
-        }
-        else
-        {
-            CollectTensors(item.value(), out);
-        }
-    }
-}
-
 const torch::Tensor &Need(const std::unordered_map<std::string, torch::Tensor> &w, const std::string &key)
 {
     auto it = w.find(key);
@@ -276,62 +250,24 @@ void DepthEncoder::EnsureLoaded(const std::string &vision_weight_path)
     {
         return;
     }
-    // Prefer C++-friendly EPWT binary (scripts/export_vision_weight_bin.py).
-    // Raw torch.save(.pt) dicts are not reliably loadable via LibTorch unpickler.
-    std::string load_path = vision_weight_path;
+    // EPWT .bin only (scripts/export_vision_weight_bin.py). Never open torch.save(.pt):
+    // LibTorch PyTorchStreamReader/unpickler fails on those dict zips (central-directory /
+    // GenericDict asserts) and release builds print stripped <unknown> frames.
     const std::string bin_path = SiblingBinPath(vision_weight_path);
-    std::unordered_map<std::string, torch::Tensor> weights;
-    if (FileReadable(bin_path))
+    if (!FileReadable(bin_path))
     {
-        weights = LoadEpwtBin(bin_path);
-        load_path = bin_path;
+        throw std::runtime_error(
+            "vision EPWT .bin not found at " + bin_path +
+            "; run scripts/export_vision_weight_bin.py (C++ will not load vision_weight.pt)");
     }
-    else if (FileReadable(vision_weight_path))
+    if (vision_weight_path.size() >= 3 &&
+        vision_weight_path.compare(vision_weight_path.size() - 3, 3, ".pt") == 0 &&
+        bin_path != vision_weight_path)
     {
-        // Best-effort torch zip archive (works for some JIT/module dumps).
-        caffe2::serialize::PyTorchStreamReader reader(vision_weight_path);
-        std::string archive;
-        bool has_root_data_pkl = false;
-        for (const auto &rec : reader.getAllRecords())
-        {
-            if (rec == "data.pkl")
-            {
-                has_root_data_pkl = true;
-            }
-            const std::string suffix = "/data.pkl";
-            if (rec.size() > suffix.size() &&
-                rec.compare(rec.size() - suffix.size(), suffix.size(), suffix) == 0)
-            {
-                archive = rec.substr(0, rec.size() - suffix.size());
-                break;
-            }
-        }
-        if (archive.empty() && has_root_data_pkl)
-        {
-            archive = "data";
-        }
-        if (archive.empty())
-        {
-            throw std::runtime_error(
-                "no loadable vision weights; run scripts/export_vision_weight_bin.py to create " +
-                bin_path);
-        }
-        c10::IValue loaded = torch::jit::readArchiveAndTensors(
-            archive, "", "data/", c10::nullopt, c10::nullopt, c10::Device(c10::kCPU), reader);
-        CollectTensors(loaded, weights);
-        if (weights.count("depth_encoder_state_dict") == 0 &&
-            weights.count("base_backbone.image_compression.0.weight") == 0)
-        {
-            // Nested dict under depth_encoder_state_dict may appear as empty after unpickle.
-            throw std::runtime_error(
-                "torch archive did not yield encoder tensors; export " + bin_path +
-                " with scripts/export_vision_weight_bin.py");
-        }
+        std::cout << "[EP_DEPTH] ignoring torch .pt path; loading EPWT sibling " << bin_path
+                  << std::endl;
     }
-    else
-    {
-        throw std::runtime_error("vision weight not found: " + vision_weight_path);
-    }
+    std::unordered_map<std::string, torch::Tensor> weights = LoadEpwtBin(bin_path);
 
     auto take = [&](const std::string &key) { return Need(weights, key); };
     impl->conv1_w = take("base_backbone.image_compression.0.weight");
@@ -354,7 +290,7 @@ void DepthEncoder::EnsureLoaded(const std::string &vision_weight_path)
     impl->out_b = take("output_mlp.0.bias");
     impl->hidden = torch::zeros({1, 1, 512}, torch::kFloat32);
     ok = true;
-    std::cout << "[EP_DEPTH] loaded vision encoder from " << load_path << std::endl;
+    std::cout << "[EP_DEPTH] loaded vision encoder from " << bin_path << std::endl;
 #else
     (void)vision_weight_path;
     throw std::runtime_error("libtorch is not enabled");

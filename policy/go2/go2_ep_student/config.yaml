@@ -5,8 +5,8 @@
 
 go2/go2_ep_student:
   model_name: "base_jit.pt"
-  # C++ loads sibling vision_weight.bin (EPWT); generate via scripts/export_vision_weight_bin.py
-  vision_weight_name: "vision_weight.pt"
+  # C++ DepthEncoder loads EPWT only (scripts/export_vision_weight_bin.py). Not torch.save .pt.
+  vision_weight_name: "vision_weight.bin"
   # InitRL buffer sizing (himloco-shaped); EP Forward builds 753-d obs separately.
   num_observations: 45
   observations: ["ang_vel", "gravity_vec", "commands", "dof_pos", "dof_vel", "actions"]

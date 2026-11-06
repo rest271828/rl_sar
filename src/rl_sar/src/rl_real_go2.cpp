@@ -255,7 +255,8 @@ std::string RL_Real::EpVisionWeightPath() const
     {
         cfg = "go2_ep_student";
     }
-    std::string weight_name = "vision_weight.pt";
+    // EPWT .bin only — LibTorch cannot reliably unpickle torch.save(.pt) dicts.
+    std::string weight_name = "vision_weight.bin";
     try
     {
         weight_name = this->params.Get<std::string>("vision_weight_name");
@@ -269,13 +270,15 @@ std::string RL_Real::EpVisionWeightPath() const
 void RL_Real::EnsureEpEncoderLoaded()
 {
     std::call_once(this->ep_encoder_once_, [this]() {
+        const std::string path = this->EpVisionWeightPath();
         try
         {
-            this->ep_encoder_.EnsureLoaded(this->EpVisionWeightPath());
+            this->ep_encoder_.EnsureLoaded(path);
         }
         catch (const std::exception &e)
         {
-            std::cerr << "[EP_DEPTH] encoder preload failed: " << e.what() << std::endl;
+            std::cerr << "[EP_DEPTH] encoder preload failed (" << path << "): " << e.what()
+                      << std::endl;
         }
     });
 }
