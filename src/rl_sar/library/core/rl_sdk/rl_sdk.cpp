@@ -487,6 +487,19 @@ void RL::ReadYaml(const std::string& file_path, const std::string& file_name)
     }
 }
 
+void RL::CacheStandParamsFromBase()
+{
+    this->stand_default_dof_pos = this->params.Get<std::vector<float>>("default_dof_pos");
+    this->stand_fixed_kp = this->params.Get<std::vector<float>>("fixed_kp");
+    this->stand_fixed_kd = this->params.Get<std::vector<float>>("fixed_kd");
+    if (this->stand_default_dof_pos.empty() || this->stand_fixed_kp.empty() || this->stand_fixed_kd.empty())
+    {
+        std::cout << LOGGER::WARNING
+                  << "CacheStandParamsFromBase: missing default_dof_pos/fixed_kp/fixed_kd in base.yaml"
+                  << std::endl;
+    }
+}
+
 void RL::CSVInit(std::string robot_path)
 {
     csv_filename = std::string(POLICY_DIR) + "/" + robot_path + "/motor";
@@ -561,8 +574,19 @@ bool RLFSMState::Interpolate(
     percent += step;
     percent = std::min(percent, 1.0f);
 
-    auto kp = use_fixed_gains ? rl.params.Get<std::vector<float>>("fixed_kp") : rl.params.Get<std::vector<float>>("rl_kp");
-    auto kd = use_fixed_gains ? rl.params.Get<std::vector<float>>("fixed_kd") : rl.params.Get<std::vector<float>>("rl_kd");
+    // Prefer cached base.yaml stand gains when present so GetUp/GetDown stay
+    // stable after InitRL merges policy configs that omit or change fixed_kp/kd.
+    std::vector<float> kp, kd;
+    if (use_fixed_gains && !rl.stand_fixed_kp.empty() && !rl.stand_fixed_kd.empty())
+    {
+        kp = rl.stand_fixed_kp;
+        kd = rl.stand_fixed_kd;
+    }
+    else
+    {
+        kp = use_fixed_gains ? rl.params.Get<std::vector<float>>("fixed_kp") : rl.params.Get<std::vector<float>>("rl_kp");
+        kd = use_fixed_gains ? rl.params.Get<std::vector<float>>("fixed_kd") : rl.params.Get<std::vector<float>>("rl_kd");
+    }
 
     for (int i = 0; i < rl.params.Get<int>("num_of_dofs"); ++i)
     {
