@@ -2,8 +2,8 @@
 """Thin launcher: EP Student MuJoCo shell eval (plane depth / stable_isaac_v6).
 
 Resolution order:
-1) A6000 original path (if present on this machine)
-2) Dropped tree from user pack: third_party/ep_on_shen_shell/mujoco_ep_shen_shell_eval.py
+1) A6000 original path (if present)
+2) Copied tree: third_party/ep_on_shen_shell/mujoco_ep_shen_shell_eval.py
 3) In-repo local shell mujoco_ep_shell_eval.py
 """
 import runpy

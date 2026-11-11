@@ -42,3 +42,9 @@ temp_extract*/
 
 # robot descriptions
 rl_sar_zoo
+
+# A6000 shell local runs
+third_party/**/out/
+third_party/**/logs/
+third_party/**/videos/
+third_party/**/__pycache__/
