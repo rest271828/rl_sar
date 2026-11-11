@@ -749,7 +749,7 @@ if(USE_MUJOCO)
     )
 
     target_link_libraries(rl_sim_mujoco
-        rl_sdk observation_buffer ${YAML_CPP_LIBRARIES}
+        rl_sdk observation_buffer ep_student ${YAML_CPP_LIBRARIES}
         Threads::Threads mujoco_prebuilt glfw
     )
 

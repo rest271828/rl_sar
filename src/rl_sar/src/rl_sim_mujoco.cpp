@@ -6,7 +6,63 @@
 #include "rl_sim_mujoco.hpp"
 #include "vector_math.hpp"
 
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+
 RL_Sim* RL_Sim::instance = nullptr;
+
+namespace
+{
+constexpr double kPitchDeg = 22.9;
+constexpr double kCamBody[3] = {0.24, -0.0175, 0.12};
+constexpr double kHfovDeg = 87.0;
+constexpr double kFar = 2.0;
+
+struct PlaneRays
+{
+    std::vector<double> dirs_cam;
+    std::vector<double> plane_scale;
+    bool ready = false;
+};
+
+PlaneRays &Rays()
+{
+    static PlaneRays rays;
+    if (rays.ready)
+    {
+        return rays;
+    }
+    const int n = ep_student::kDepthH * ep_student::kDepthW;
+    rays.dirs_cam.resize(n * 3);
+    rays.plane_scale.resize(n);
+    const double hfov = kHfovDeg * 3.14159265358979323846 / 180.0;
+    const double fx = 0.5 * ep_student::kDepthW / std::tan(0.5 * hfov);
+    const double fy = fx;
+    const double cx = 0.5 * (ep_student::kDepthW - 1);
+    const double cy = 0.5 * (ep_student::kDepthH - 1);
+    for (int v = 0; v < ep_student::kDepthH; ++v)
+    {
+        for (int u = 0; u < ep_student::kDepthW; ++u)
+        {
+            const int i = v * ep_student::kDepthW + u;
+            double x = (u - cx) / fx;
+            double y = -(v - cy) / fy;
+            double z = -1.0;
+            const double nrm = std::sqrt(x * x + y * y + z * z);
+            x /= nrm;
+            y /= nrm;
+            z /= nrm;
+            rays.dirs_cam[3 * i + 0] = x;
+            rays.dirs_cam[3 * i + 1] = y;
+            rays.dirs_cam[3 * i + 2] = z;
+            rays.plane_scale[i] = -z;
+        }
+    }
+    rays.ready = true;
+    return rays;
+}
+} // namespace
 
 RL_Sim::RL_Sim(int argc, char **argv)
 {
@@ -62,7 +118,16 @@ RL_Sim::RL_Sim(int argc, char **argv)
         std::make_unique<mj::GlfwAdapter>(),
         &cam, &opt, &pert, /* is_passive = */ false);
 
+    // Prefer repo scenes/go2_ep_step40 for EP step40 XMLs; fall back to rl_sar_zoo mjcf.
     std::string filename = std::string(CMAKE_CURRENT_SOURCE_DIR) + "/../rl_sar_zoo/" + this->robot_name + "_description/mjcf/" + this->scene_name + ".xml";
+    {
+        const std::string scenes_ep = std::string(CMAKE_CURRENT_SOURCE_DIR) + "/../../scenes/go2_ep_step40/" + this->scene_name + ".xml";
+        if (std::filesystem::exists(scenes_ep))
+        {
+            filename = scenes_ep;
+        }
+    }
+    std::cout << LOGGER::INFO << "[MuJoCo] scene xml: " << filename << std::endl;
 
     // start physics thread
     std::thread physicsthreadhandle(&PhysicsThread, sim.get(), filename.c_str());
@@ -405,6 +470,204 @@ void RL_Sim::RunModel()
     }
 }
 
+bool RL_Sim::EpSceneIsStep() const
+{
+    return this->scene_name.find("step40") != std::string::npos;
+}
+
+bool RL_Sim::EpTerrainIsFlat() const
+{
+    const char *terr = std::getenv("RL_SAR_EP_TERRAIN");
+    if (terr && *terr)
+    {
+        const std::string t(terr);
+        if (t == "parkour")
+        {
+            return false;
+        }
+        if (t == "flat")
+        {
+            return true;
+        }
+    }
+    return !this->EpSceneIsStep();
+}
+
+void RL_Sim::ResetEpDepthState()
+{
+    this->ep_latent_.assign(EP_LATENT, 0.0f);
+    this->ep_yaw_.assign(2, 0.0f);
+    this->ep_depth_proc_.assign(ep_student::kOutH * ep_student::kOutW, -0.5f);
+    this->ep_encoder_.Reset();
+}
+
+void RL_Sim::EnsureEpDepthEncoder()
+{
+    std::string weight_name = "vision_weight.bin";
+    try
+    {
+        weight_name = this->params.Get<std::string>("vision_weight_name");
+    }
+    catch (...)
+    {
+    }
+    const std::string path = std::string(POLICY_DIR) + "/" + this->robot_name + "/" + this->config_name + "/" + weight_name;
+    this->ep_encoder_.EnsureLoaded(path);
+}
+
+void RL_Sim::UpdateEpDepthLatent(const std::vector<float> &proprio53)
+{
+    if (!this->mj_model || !this->mj_data || (int)proprio53.size() < EP_N_PROPRIO)
+    {
+        return;
+    }
+    try
+    {
+        this->EnsureEpDepthEncoder();
+    }
+    catch (const std::exception &e)
+    {
+        static bool warned = false;
+        if (!warned)
+        {
+            warned = true;
+            std::cerr << "[EP_DEPTH] encoder unavailable, latent stays 0: " << e.what() << std::endl;
+        }
+        if ((int)this->ep_latent_.size() != EP_LATENT)
+        {
+            this->ep_latent_.assign(EP_LATENT, 0.0f);
+        }
+        if ((int)this->ep_yaw_.size() != 2)
+        {
+            this->ep_yaw_.assign(2, 0.0f);
+        }
+        return;
+    }
+
+    int bid = mj_name2id(this->mj_model, mjOBJ_BODY, "base");
+    if (bid < 0)
+        bid = mj_name2id(this->mj_model, mjOBJ_BODY, "base_link");
+    if (bid < 0)
+    {
+        return;
+    }
+    const mjtNum *xpos = this->mj_data->xpos + 3 * bid;
+    const mjtNum *xmat = this->mj_data->xmat + 9 * bid;
+
+    const double pitch = kPitchDeg * 3.14159265358979323846 / 180.0;
+    const double forward[3] = {std::cos(pitch), 0.0, -std::sin(pitch)};
+    const double right[3] = {0.0, -1.0, 0.0};
+    const double z_cam[3] = {-forward[0], -forward[1], -forward[2]};
+    double up[3] = {
+        z_cam[1] * right[2] - z_cam[2] * right[1],
+        z_cam[2] * right[0] - z_cam[0] * right[2],
+        z_cam[0] * right[1] - z_cam[1] * right[0],
+    };
+    const double up_n = std::sqrt(up[0] * up[0] + up[1] * up[1] + up[2] * up[2]);
+    up[0] /= up_n;
+    up[1] /= up_n;
+    up[2] /= up_n;
+    const double r_cb[9] = {
+        right[0], up[0], z_cam[0],
+        right[1], up[1], z_cam[1],
+        right[2], up[2], z_cam[2],
+    };
+    double r_cw[9];
+    for (int i = 0; i < 3; ++i)
+    {
+        for (int j = 0; j < 3; ++j)
+        {
+            r_cw[3 * i + j] = 0.0;
+            for (int k = 0; k < 3; ++k)
+            {
+                r_cw[3 * i + j] += xmat[3 * i + k] * r_cb[3 * k + j];
+            }
+        }
+    }
+    double cam_body_w[3];
+    for (int i = 0; i < 3; ++i)
+    {
+        cam_body_w[i] = xmat[3 * i + 0] * kCamBody[0] + xmat[3 * i + 1] * kCamBody[1] + xmat[3 * i + 2] * kCamBody[2];
+    }
+    const mjtNum pnt[3] = {xpos[0] + cam_body_w[0], xpos[1] + cam_body_w[1], xpos[2] + cam_body_w[2]};
+
+    PlaneRays &rays = Rays();
+    const int nray = ep_student::kDepthH * ep_student::kDepthW;
+    std::vector<mjtNum> dirs_w(nray * 3);
+    for (int i = 0; i < nray; ++i)
+    {
+        const double x = rays.dirs_cam[3 * i + 0];
+        const double y = rays.dirs_cam[3 * i + 1];
+        const double z = rays.dirs_cam[3 * i + 2];
+        dirs_w[3 * i + 0] = r_cw[0] * x + r_cw[1] * y + r_cw[2] * z;
+        dirs_w[3 * i + 1] = r_cw[3] * x + r_cw[4] * y + r_cw[5] * z;
+        dirs_w[3 * i + 2] = r_cw[6] * x + r_cw[7] * y + r_cw[8] * z;
+    }
+    std::vector<int> geomid(nray, -1);
+    std::vector<mjtNum> dist(nray, -1.0);
+    mjtByte geomgroup[6] = {1, 1, 0, 0, 1, 1};
+    mj_multiRay(
+        this->mj_model, this->mj_data, pnt, dirs_w.data(), geomgroup, 1, bid,
+        geomid.data(), dist.data(), nray, kFar * 2.0);
+
+    std::vector<float> meters(nray, static_cast<float>(kFar));
+    for (int i = 0; i < nray; ++i)
+    {
+        if (dist[i] >= 0.0)
+        {
+            meters[i] = static_cast<float>(std::min(dist[i] * rays.plane_scale[i], kFar));
+        }
+        if (meters[i] < 0.0f)
+        {
+            meters[i] = 0.0f;
+        }
+    }
+    // Already on the 60x106 training grid: crop + bicubic via shared preprocess.
+    ep_student::PreprocessDepthMeters(meters.data(), ep_student::kDepthH, ep_student::kDepthW, this->ep_depth_proc_);
+    this->ep_encoder_.Encode(this->ep_depth_proc_, proprio53, this->ep_latent_, this->ep_yaw_);
+}
+
+void RL_Sim::MaybeDumpEpAction(const std::vector<float> &actions)
+{
+    const char *path = std::getenv("RL_SAR_EP_ACTION_DUMP");
+    if (!path || !*path)
+    {
+        return;
+    }
+    if (!this->ep_action_dump_open_)
+    {
+        this->ep_action_dump_.open(path, std::ios::out);
+        this->ep_action_dump_open_ = this->ep_action_dump_.is_open();
+        if (!this->ep_action_dump_open_)
+        {
+            std::cerr << "[EP_MUJOCO] cannot open RL_SAR_EP_ACTION_DUMP=" << path << std::endl;
+            return;
+        }
+        this->ep_action_dump_ << "policy_step,z,cmd_x,amax";
+        for (int i = 0; i < 12; ++i)
+            this->ep_action_dump_ << ",a" << i;
+        this->ep_action_dump_ << "\n";
+        std::cout << LOGGER::INFO << "[EP_MUJOCO] action dump -> " << path << std::endl;
+    }
+    float z = 0.0f;
+    if (this->mj_data && this->mj_model)
+    {
+        z = (float)this->mj_data->qpos[2];
+        int bid = mj_name2id(this->mj_model, mjOBJ_BODY, "base");
+        if (bid < 0)
+            bid = mj_name2id(this->mj_model, mjOBJ_BODY, "base_link");
+        if (bid >= 0)
+            z = (float)this->mj_data->xpos[3 * bid + 2];
+    }
+    float amax = 0.0f;
+    for (float a : actions)
+        amax = std::max(amax, std::fabs(a));
+    this->ep_action_dump_ << this->ep_policy_step_ << "," << z << "," << this->control.x << "," << amax;
+    for (int i = 0; i < 12 && i < (int)actions.size(); ++i)
+        this->ep_action_dump_ << "," << actions[i];
+    this->ep_action_dump_ << "\n";
+}
+
 std::vector<float> RL_Sim::Forward()
 {
     std::unique_lock<std::mutex> lock(this->model_mutex, std::try_to_lock);
@@ -418,13 +681,36 @@ std::vector<float> RL_Sim::Forward()
 
     std::vector<float> actions;
 
-    // Extreme Parkour Student: TorchScript (obs[753], depth_latent[32]) -> action[12]
-    // MuJoCo has no depth camera: latent=0 every step (no update_interval path here).
+    // Extreme Parkour Student: (obs[753], depth_latent[32]) -> action[12]
+    // Plane depth updates encoder every 5 policy steps; other steps reuse latent.
     if (this->config_name == "go2_ep_student")
     {
+        if (this->episode_length_buf <= 1)
+        {
+            this->ep_hist_ready_ = false;
+            this->ep_policy_step_ = 0;
+            this->ResetEpDepthState();
+        }
         std::vector<float> ep_obs = this->BuildEpObservation();
-        std::vector<float> depth_latent(32, 0.0f);
-        actions = this->model->forward({ep_obs, depth_latent});
+        if (this->ep_policy_step_ % EP_UPDATE_INTERVAL == 0)
+        {
+            std::vector<float> proprio(ep_obs.begin(), ep_obs.begin() + EP_N_PROPRIO);
+            proprio[6] = 0.0f;
+            proprio[7] = 0.0f;
+            this->UpdateEpDepthLatent(proprio);
+        }
+        if (this->ep_yaw_.size() >= 2)
+        {
+            ep_obs[6] = 1.5f * this->ep_yaw_[0];
+            ep_obs[7] = 1.5f * this->ep_yaw_[1];
+        }
+        if ((int)this->ep_latent_.size() != EP_LATENT)
+        {
+            this->ep_latent_.assign(EP_LATENT, 0.0f);
+        }
+        actions = this->model->forward({ep_obs, this->ep_latent_});
+        this->MaybeDumpEpAction(actions);
+        this->ep_policy_step_ += 1;
         if ((int)actions.size() >= 12)
         {
             this->ep_last_action_.assign(actions.begin(), actions.begin() + 12);
@@ -486,13 +772,11 @@ std::vector<float> RL_Sim::BuildEpObservation()
         proprio[4] = euler[1]; // pitch
     }
 
-    // indices 5,6,7 = yaw deltas — without depth camera leave 0 (evaluate overwrites 6:8 from depth yaw)
+    // indices 5,6,7 stay 0 here. Forward writes yaw*1.5 into 6:8 after depth update.
     // commands: 8,9 masked 0; 10 = vx
     proprio[10] = this->control.x;
-    // MuJoCo stock scene is flat ground → parkour_flat one-hot (env_class==17)
-    // Override with RL_SAR_EP_TERRAIN=parkour for non-flat scenes.
-    const char* terr = std::getenv("RL_SAR_EP_TERRAIN");
-    bool flat = !(terr && std::string(terr) == "parkour");
+    // step40 scenes default to non-flat one-hot; RL_SAR_EP_TERRAIN=parkour|flat overrides.
+    const bool flat = this->EpTerrainIsFlat();
     proprio[11] = flat ? 0.0f : 1.0f;
     proprio[12] = flat ? 1.0f : 0.0f;
 

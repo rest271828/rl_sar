@@ -14,6 +14,7 @@
 #include "inference_runtime.hpp"
 #include "loop.hpp"
 #include "fsm_all.hpp"
+#include "ep_student.hpp"
 
 #include <csignal>
 #include <vector>
@@ -104,17 +105,34 @@ private:
     std::map<std::string, float> joint_efforts;
     void StartJointController(const std::string& ros_namespace, const std::vector<std::string>& names);
 
-    // Extreme Parkour Student obs helpers (MuJoCo has no depth camera)
+    // Extreme Parkour Student. Plane-depth rays update every EP_UPDATE_INTERVAL
+    // policy steps (same contract as Python mujoco_ep_shell_eval.py).
     static constexpr int EP_N_PROPRIO = 53;
     static constexpr int EP_N_SCAN = 132;
     static constexpr int EP_N_PRIV_E = 9;
     static constexpr int EP_N_PRIV_L = 29;
     static constexpr int EP_HIST_LEN = 10;
     static constexpr int EP_N_OBS = EP_N_PROPRIO + EP_N_SCAN + EP_N_PRIV_E + EP_N_PRIV_L + EP_HIST_LEN * EP_N_PROPRIO; // 753
+    static constexpr int EP_UPDATE_INTERVAL = 5;
+    static constexpr int EP_LATENT = 32;
     std::vector<float> ep_proprio_hist_; // hist_len * n_proprio, oldest→newest
-    std::vector<float> ep_last_action_;  // policy-space 12
+    std::vector<float> ep_last_action_;  // policy-space 12, FR/FL/RR/RL
+    std::vector<float> ep_latent_;
+    std::vector<float> ep_yaw_;
     bool ep_hist_ready_ = false;
+    int ep_policy_step_ = 0;
+    bool EpSceneIsStep() const;
+    bool EpTerrainIsFlat() const;
+    void ResetEpDepthState();
+    void EnsureEpDepthEncoder();
+    void UpdateEpDepthLatent(const std::vector<float> &proprio53);
+    void MaybeDumpEpAction(const std::vector<float> &actions);
     std::vector<float> BuildEpObservation();
+
+    ep_student::DepthEncoder ep_encoder_;
+    std::vector<float> ep_depth_proc_;
+    std::ofstream ep_action_dump_;
+    bool ep_action_dump_open_ = false;
 };
 
 

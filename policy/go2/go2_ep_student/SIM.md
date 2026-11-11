@@ -1,13 +1,14 @@
 # Sim entrypoints
 
-| Path | Command | Depth | MXD |
+| Path | Command | Depth | Notes |
 |---|---|---|---|
-| Isaac `jit` | `sim_isaac_bridge.py --backend jit ...` | interval-5 ELU encoder | **0.90** |
-| Isaac `ckpt_est` | `--backend ckpt_est` | same | **0.90** |
-| Isaac `ckpt` | `--backend ckpt` | same + GT priv | **0.88** |
-| MuJoCo shell | `RL_SAR_GO2_CONFIG=go2_ep_student RL_SAR_AUTO_RL=1 bash scripts/run_go2_mujoco_xvfb.sh` | latent=0 | n/a |
-| MuJoCo smoke | `bash scripts/smoke_go2_ep_mujoco.sh` | latent=0 | n/a |
-| Recorded `.mm` offline AB | `python policy/go2/go2_ep_student/mm_offline_replay.py --session logs/<sess>_go2_test --modes fill,hold,refuse` | real dump + valid% gate (default 0.2) | n/a |
-| C++ depth smoke + gate | `RL_SAR_EP_DEPTH_BIN=... RL_SAR_EP_DEPTH_GATE=refuse ./cmake_build/bin/ep_depth_smoke` | single `.mm`; hold needs `RL_SAR_EP_DEPTH_HOLD_BIN` | n/a |
+| MuJoCo Python shell | `python policy/go2/go2_ep_student/mujoco_ep_shell_eval.py --config stable_isaac_v6 --dump-actions ...` | interval-5 plane rays | **Preferred** local climb + action dump |
+| MuJoCo launcher | `python policy/go2/go2_ep_student/sim_mujoco_shell_eval.py ...` | same | Uses A6000 script if present, else local shell |
+| C++ `rl_sim_mujoco` | `RL_SAR_GO2_CONFIG=go2_ep_student RL_SAR_AUTO_RL=1 RL_SAR_CMD_X=1.0 RL_SAR_EP_ACTION_DUMP=... ./cmake_build/bin/rl_sim_mujoco go2 scene_step40_stable_v6` | interval-5 plane rays | Needs DISPLAY; dump via env |
+| Isaac `jit` | `sim_isaac_bridge.py --backend jit ...` | interval-5 ELU encoder | needs extreme-parkour activate |
+| Isaac `ckpt_est` | `--backend ckpt_est` | same | |
+| Isaac `ckpt` | `--backend ckpt` | same + GT priv | |
 
-**错误节拍：** GRU 每控制步前进（错）vs 仅 `update_interval=5` 有新深度时前进（对）。
+**Depth cadence：** GRU only advances when `update_interval=5` has a new depth frame (not every control step).
+
+**Scene：** `scenes/go2_ep_step40/scene_step40_stable_v6.xml` (`stable_isaac_v6`). Zoo copy: `src/rl_sar_zoo/go2_description/mjcf/scene_step40_stable_v6.xml`.
