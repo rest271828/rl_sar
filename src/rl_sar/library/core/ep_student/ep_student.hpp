@@ -29,6 +29,9 @@ constexpr int kCropW = 98;
 constexpr int kOutH = 58;
 constexpr int kOutW = 87;
 constexpr float kFarMeters = 2.0f;
+// Fraction of uint16 mm pixels with value > 0 required to accept a depth frame
+// for encoder/GRU update (sim/offline + future deploy). Below → hold-last or refuse.
+constexpr float kDefaultMinValidFrac = 0.2f;
 
 struct ObsScales
 {
@@ -92,6 +95,13 @@ void PreprocessDepthMeters(const float *src_meters, int src_h, int src_w,
 // Convert 16UC1 millimeters (scale 0.001) with clip [0, far].
 void PreprocessDepthUint16Mm(const uint16_t *src_mm, int src_h, int src_w,
                              std::vector<float> &out_58x87, float far_m = kFarMeters);
+
+// Share of pixels with mm > 0. Returns 0 if args invalid.
+float DepthValidFractionUint16Mm(const uint16_t *src_mm, int src_h, int src_w);
+
+// True iff valid fraction >= min_valid (default kDefaultMinValidFrac).
+bool DepthFrameAcceptableUint16Mm(const uint16_t *src_mm, int src_h, int src_w,
+                                  float min_valid = kDefaultMinValidFrac);
 
 std::vector<float> BuildObservation(const ProprioInput &in, HistState &hist);
 

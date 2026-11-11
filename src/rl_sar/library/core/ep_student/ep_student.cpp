@@ -435,6 +435,30 @@ void PreprocessDepthUint16Mm(const uint16_t *src_mm, int src_h, int src_w,
     PreprocessDepthMeters(meters.data(), src_h, src_w, out_58x87);
 }
 
+float DepthValidFractionUint16Mm(const uint16_t *src_mm, int src_h, int src_w)
+{
+    if (!src_mm || src_h <= 0 || src_w <= 0)
+    {
+        return 0.0f;
+    }
+    const int n = src_h * src_w;
+    int valid = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        if (src_mm[i] > 0)
+        {
+            ++valid;
+        }
+    }
+    return static_cast<float>(valid) / static_cast<float>(n);
+}
+
+bool DepthFrameAcceptableUint16Mm(const uint16_t *src_mm, int src_h, int src_w,
+                                  float min_valid)
+{
+    return DepthValidFractionUint16Mm(src_mm, src_h, src_w) >= min_valid;
+}
+
 std::vector<float> BuildObservation(const ProprioInput &in, HistState &hist)
 {
     std::vector<float> proprio(kNProprio, 0.0f);
